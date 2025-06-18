@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
 
@@ -36,6 +37,11 @@ type NFTResponse struct {
 
 func init() {
 	var err error
+
+	err = godotenv.Load()
+    if err != nil {
+        log.Println("No .env file found or couldn't load it")
+    }
 
 	// Connect to Postgres
 	dbURL := os.Getenv("DB_URL") // Example: postgres://user:pass@localhost/dbname?sslmode=disable
