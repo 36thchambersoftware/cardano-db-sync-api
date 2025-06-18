@@ -149,7 +149,7 @@ func nftOwnersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	redisClient.Set(ctx, cacheKey, jsonData, 10*time.Minute)
+	redisClient.Set(ctx, cacheKey, jsonData, 1*time.Minute)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(jsonData)
