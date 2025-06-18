@@ -173,9 +173,32 @@ func nftOwnersHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(jsonData)
 }
 
+func getCurrentEpoch(w http.ResponseWriter, r *http.Request) {
+	query := `SELECT MAX(no) FROM epoch`
+	row := db.QueryRowContext(ctx, query)
+
+	var epoch int64
+	if err := row.Scan(&epoch); err != nil {
+		http.Error(w, "Failed to get current epoch", http.StatusInternalServerError)
+		log.Printf("DB error: %v", err)
+		return
+	}
+
+	response := map[string]int64{"current_epoch": epoch}
+	jsonData, err := json.Marshal(response)
+	if err != nil {
+		http.Error(w, "JSON encode error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(jsonData)
+}
+
 func main() {
 	registerRoute("/", "Home page listing all available API endpoints.", "/", homeHandler)
 	registerRoute("/nft-owners", "Get address → NFT count for a specific policy ID.", "/nft-owners?policy_id=<your_policy_id>", nftOwnersHandler)
+	registerRoute("/current-epoch", "Get the current Cardano epoch.", "/current-epoch", getCurrentEpoch)
 
 	log.Println("API running at http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
