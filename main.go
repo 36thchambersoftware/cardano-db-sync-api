@@ -167,8 +167,6 @@ func nftOwnersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Default().Info("NFT owners fetched", "jsonData", jsonData)
-
 	// redisClient.Set(ctx, cacheKey, jsonData, 1*time.Minute)
 
 	w.Header().Set("Content-Type", "application/json")
