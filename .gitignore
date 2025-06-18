@@ -1,0 +1,34 @@
+# Binaries for programs and plugins
+*.exe
+*.dll
+*.so
+*.dylib
+*.wasm
+*.bin
+
+# Test binary, built with `go test -c`
+*.test
+
+# Compiled Go packages
+*.a
+
+# Output of `go build`
+# If you use a custom output directory (e.g., `bin/`), add it here:
+# /bin/
+
+# Dependency directories
+# Vendor directory (if not using Go modules or if explicitly vendoring)
+vendor/
+
+# Go module cache and build cache
+.go/
+go.work.sum
+
+# Editor and OS specific files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.bak
+*.tmp
