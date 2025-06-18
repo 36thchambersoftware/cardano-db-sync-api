@@ -141,7 +141,6 @@ func nftOwnersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	slog.Default().Info("Querying NFT owners", "policy_id", policyID)
 	slog.Default().Info("Query executed", "query", query)
 	slog.Default().Info("Rows returned", "count", rows.Err() == nil)
 	if err := rows.Err(); err != nil {
@@ -161,7 +160,6 @@ func nftOwnersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Default().Info("NFT owners fetched", "count", len(results))
-	slog.Default().Info("NFT owners fetched", "results", results)
 
 	jsonData, err := json.Marshal(results)
 	if err != nil {
