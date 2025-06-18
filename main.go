@@ -3,13 +3,13 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"html/template"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
-	"time"
 
 	"github.com/go-redis/redis/v8"
 	"github.com/joho/godotenv"
@@ -103,15 +103,19 @@ func nftOwnersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cacheKey := "nft_owners:" + policyID
-	if cached, err := redisClient.Get(ctx, cacheKey).Result(); err == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(cached))
-		return
-	}
+	// cacheKey := "nft_owners:" + policyID
+	// if cached, err := redisClient.Get(ctx, cacheKey).Result(); err == nil {
+	// 	w.Header().Set("Content-Type", "application/json")
+	// 	w.Write([]byte(cached))
+	// 	return
+	// }
 
-	policyID = "\\x" + policyID
-	slog.Default().Info("Fetching NFT owners", "policy_id", policyID)
+	decodedPolicy, err := hex.DecodeString(policyID)
+    if err != nil {
+        http.Error(w, "Invalid policy_id hex", http.StatusBadRequest)
+        return
+    }
+	slog.Default().Info("Fetching NFT owners", "policy_id", decodedPolicy)
 
 	query := `
 	SELECT
@@ -129,7 +133,7 @@ func nftOwnersHandler(w http.ResponseWriter, r *http.Request) {
 	ORDER BY total_quantity DESC;
 	`
 
-	rows, err := db.QueryContext(ctx, query, policyID)
+	rows, err := db.QueryContext(ctx, query, decodedPolicy)
 	if err != nil {
 		http.Error(w, "Database query error", http.StatusInternalServerError)
 		log.Printf("DB error: %v", err)
@@ -167,7 +171,7 @@ func nftOwnersHandler(w http.ResponseWriter, r *http.Request) {
 
 	slog.Default().Info("NFT owners fetched", "jsonData", jsonData)
 
-	redisClient.Set(ctx, cacheKey, jsonData, 1*time.Minute)
+	// redisClient.Set(ctx, cacheKey, jsonData, 1*time.Minute)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(jsonData)
