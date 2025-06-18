@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"html/template"
 	"log"
 	"log/slog"
@@ -111,7 +110,7 @@ func nftOwnersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	policyID = fmt.Sprintf("\\x%s", policyID)
+	policyID = "\\x" + policyID
 	slog.Default().Info("Fetching NFT owners", "policy_id", policyID)
 
 	query := `
@@ -157,11 +156,16 @@ func nftOwnersHandler(w http.ResponseWriter, r *http.Request) {
 		results = append(results, res)
 	}
 
+	slog.Default().Info("NFT owners fetched", "count", len(results))
+	slog.Default().Info("NFT owners fetched", "results", results)
+
 	jsonData, err := json.Marshal(results)
 	if err != nil {
 		http.Error(w, "JSON encode error", http.StatusInternalServerError)
 		return
 	}
+
+	slog.Default().Info("NFT owners fetched", "jsonData", jsonData)
 
 	redisClient.Set(ctx, cacheKey, jsonData, 1*time.Minute)
 
