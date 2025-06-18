@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -109,6 +111,9 @@ func nftOwnersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	policyID = fmt.Sprintf("\\x%s", policyID)
+	slog.Default().Info("Fetching NFT owners", "policy_id", policyID)
+
 	query := `
 	SELECT
 		address.address AS owner_address,
@@ -132,6 +137,15 @@ func nftOwnersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rows.Close()
+
+	slog.Default().Info("Querying NFT owners", "policy_id", policyID)
+	slog.Default().Info("Query executed", "query", query)
+	slog.Default().Info("Rows returned", "count", rows.Err() == nil)
+	if err := rows.Err(); err != nil {
+		http.Error(w, "Error reading rows", http.StatusInternalServerError)
+		log.Printf("Row error: %v", err)
+		return
+	}
 
 	var results []NFTResponse
 	for rows.Next() {
