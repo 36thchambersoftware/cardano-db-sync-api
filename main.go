@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/go-redis/redis/v8"
 	"github.com/joho/godotenv"
@@ -28,12 +29,6 @@ type Route struct {
 	Path        string
 	Description string
 	Usage       string
-}
-
-// NFTResponse represents an address and the number of NFTs it holds
-type NFTResponse struct {
-	Address string `json:"address"`
-	Count   int64  `json:"count"`
 }
 
 func init() {
@@ -68,27 +63,88 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Cardano NFT API</title>
+    <title>Cardano DB Sync API</title>
     <style>
         body { font-family: sans-serif; padding: 2em; }
         code { background: #eee; padding: 0.2em 0.4em; border-radius: 4px; }
         li { margin-bottom: 1em; }
+        .category { margin-top: 2em; }
+        .category h3 { color: #333; border-bottom: 2px solid #eee; padding-bottom: 0.5em; }
     </style>
 </head>
 <body>
-    <h1>Cardano NFT API</h1>
-    <p>This server provides endpoints to query Cardano NFT ownership data.</p>
+    <h1>Cardano DB Sync API</h1>
+    <p>A comprehensive API for querying Cardano blockchain data, compatible with Blockfrost API endpoints.</p>
+    
+    <div style="background: #f0f8ff; padding: 1em; border-radius: 8px; margin: 1em 0;">
+        <h3>🔐 Authentication</h3>
+        <p>All API endpoints require authentication. Include your API key using one of these methods:</p>
+        <ul>
+            <li><strong>Header:</strong> <code>X-API-Key: your-api-key</code></li>
+            <li><strong>Bearer Token:</strong> <code>Authorization: Bearer your-api-key</code></li>
+            <li><strong>Query Parameter:</strong> <code>?api_key=your-api-key</code></li>
+        </ul>
+    </div>
 
-    <h2>Available Endpoints</h2>
-    <ul>
-        {{range .}}
-        <li>
-            <strong><code>{{.Path}}</code></strong><br>
-            {{.Description}}<br>
-            <em>Usage:</em> <code>{{.Usage}}</code>
-        </li>
-        {{end}}
-    </ul>
+    <div class="category">
+        <h3>Network</h3>
+        <ul>
+            <li><strong><code>/network</code></strong><br>Get network information including supply and stake</li>
+        </ul>
+    </div>
+
+    <div class="category">
+        <h3>Blocks</h3>
+        <ul>
+            <li><strong><code>/blocks/latest</code></strong><br>Get the latest block</li>
+            <li><strong><code>/blocks/{hash_or_number}</code></strong><br>Get specific block by hash or number</li>
+        </ul>
+    </div>
+
+    <div class="category">
+        <h3>Transactions</h3>
+        <ul>
+            <li><strong><code>/txs/{hash}</code></strong><br>Get transaction details by hash</li>
+            <li><strong><code>/txs/{hash}/utxos</code></strong><br>Get transaction inputs and outputs</li>
+        </ul>
+    </div>
+
+    <div class="category">
+        <h3>Addresses</h3>
+        <ul>
+            <li><strong><code>/addresses/{address}</code></strong><br>Get address information and balance</li>
+            <li><strong><code>/addresses/{address}/transactions</code></strong><br>Get transactions for address</li>
+            <li><strong><code>/addresses/{address}/utxos</code></strong><br>Get UTXOs for address</li>
+        </ul>
+    </div>
+
+    <div class="category">
+        <h3>Assets</h3>
+        <ul>
+            <li><strong><code>/assets/{asset_id}</code></strong><br>Get asset information</li>
+            <li><strong><code>/assets/{asset_id}/addresses</code></strong><br>Get addresses holding the asset</li>
+        </ul>
+    </div>
+
+    <div class="category">
+        <h3>Epochs</h3>
+        <ul>
+            <li><strong><code>/epochs/latest</code></strong><br>Get current epoch information</li>
+        </ul>
+    </div>
+
+    <div class="category">
+        <h3>Legacy NFT Endpoints</h3>
+        <ul>
+            {{range .}}
+            <li>
+                <strong><code>{{.Path}}</code></strong><br>
+                {{.Description}}<br>
+                <em>Usage:</em> <code>{{.Usage}}</code>
+            </li>
+            {{end}}
+        </ul>
+    </div>
 </body>
 </html>`
 
@@ -173,33 +229,63 @@ func nftOwnersHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(jsonData)
 }
 
-func getCurrentEpoch(w http.ResponseWriter, r *http.Request) {
-	query := `SELECT MAX(no) FROM epoch`
-	row := db.QueryRowContext(ctx, query)
-
-	var epoch int64
-	if err := row.Scan(&epoch); err != nil {
-		http.Error(w, "Failed to get current epoch", http.StatusInternalServerError)
-		log.Printf("DB error: %v", err)
-		return
-	}
-
-	response := map[string]int64{"current_epoch": epoch}
-	jsonData, err := json.Marshal(response)
-	if err != nil {
-		http.Error(w, "JSON encode error", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(jsonData)
-}
 
 func main() {
-	registerRoute("/", "Home page listing all available API endpoints.", "/", homeHandler)
-	registerRoute("/nft-owners", "Get address → NFT count for a specific policy ID.", "/nft-owners?policy_id=<your_policy_id>", nftOwnersHandler)
-	registerRoute("/current-epoch", "Get the current Cardano epoch.", "/current-epoch", getCurrentEpoch)
+	// Public endpoints (no auth required)
+	http.HandleFunc("/", homeHandler)
+	http.HandleFunc("/health", healthHandler)
+	
+	// Development endpoint (only in dev mode)
+	http.HandleFunc("/generate-key", generateKeyHandler)
+	
+	// Protected API endpoints (require authentication)
+	http.HandleFunc("/network", authHandler(getNetworkHandler))
+	
+	// Block endpoints
+	http.HandleFunc("/blocks/latest", authHandler(getLatestBlockHandler))
+	http.HandleFunc("/blocks/", authHandler(func(w http.ResponseWriter, r *http.Request) {
+		getBlockHandler(w, r)
+	}))
+	
+	// Transaction endpoints
+	http.HandleFunc("/txs/", authHandler(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if strings.HasSuffix(path, "/utxos") {
+			getTransactionUTXOsHandler(w, r)
+		} else {
+			getTransactionHandler(w, r)
+		}
+	}))
+	
+	// Address endpoints
+	http.HandleFunc("/addresses/", authHandler(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if strings.HasSuffix(path, "/transactions") {
+			getAddressTransactionsHandler(w, r)
+		} else if strings.HasSuffix(path, "/utxos") {
+			getAddressUTXOsHandler(w, r)
+		} else {
+			getAddressHandler(w, r)
+		}
+	}))
+	
+	// Asset endpoints
+	http.HandleFunc("/assets/", authHandler(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if strings.HasSuffix(path, "/addresses") {
+			getAssetAddressesHandler(w, r)
+		} else {
+			getAssetHandler(w, r)
+		}
+	}))
+	
+	// Epoch endpoints
+	http.HandleFunc("/epochs/latest", authHandler(getCurrentEpochHandler))
+	
+	// Legacy endpoints (also protected)
+	registerRoute("/nft-owners", "Get address → NFT count for a specific policy ID.", "/nft-owners?policy_id=<your_policy_id>", authHandler(nftOwnersHandler))
 
-	log.Println("API running at http://localhost:8080")
+	log.Println("🚀 Cardano DB Sync API running at http://localhost:8080")
+	log.Println("📖 Visit http://localhost:8080 for API documentation")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
