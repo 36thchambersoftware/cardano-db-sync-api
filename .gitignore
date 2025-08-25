@@ -24,6 +24,11 @@ vendor/
 .go/
 go.work.sum
 
+# Environment files (CRITICAL: Never commit these!)
+.env
+.env.local
+.env.*.local
+
 # Editor and OS specific files
 .DS_Store
 Thumbs.db
