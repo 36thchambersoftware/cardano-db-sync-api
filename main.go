@@ -257,17 +257,35 @@ func main() {
 		}
 	}))
 	
-	// Address endpoints
+	// Change detection endpoints (perfect for hourly monitoring)
+	http.HandleFunc("/changes/addresses", authHandler(getAddressChangesHandler))      // GET addresses changed since timestamp
+	http.HandleFunc("/changes/compare", authHandler(getBulkBalanceCompareHandler))    // POST bulk balance comparison
+	http.HandleFunc("/activity/recent", authHandler(getRecentActivityHandler))       // GET recent blockchain activity
+	
+	// Address endpoints (unified routing)
 	http.HandleFunc("/addresses/", authHandler(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		if strings.HasSuffix(path, "/transactions") {
+		if strings.HasSuffix(path, "/last-activity") {
+			getAddressLastActivityHandler(w, r)
+		} else if strings.HasSuffix(path, "/transactions") {
 			getAddressTransactionsHandler(w, r)
 		} else if strings.HasSuffix(path, "/utxos") {
 			getAddressUTXOsHandler(w, r)
+		} else if strings.HasSuffix(path, "/assets") {
+			getAddressAssetsHandler(w, r)
 		} else {
-			getAddressHandler(w, r)
+			getAddressHandler(w, r)  // Returns ADA balance only (much faster)
 		}
 	}))
+	
+	// Fast endpoints (alternative)
+	http.HandleFunc("/addresses-simple/", authHandler(getAddressSimpleHandler))
+	http.HandleFunc("/addresses-count/", authHandler(getAddressUTXOCountHandler))
+	
+	// Polling-optimized endpoints
+	http.HandleFunc("/addresses-polling/", authHandler(getAddressPollingHandler))     // 10s cache
+	http.HandleFunc("/addresses-realtime/", authHandler(getAddressRealTimeHandler))  // No cache
+	http.HandleFunc("/addresses-batch", authHandler(getAddressesBatchHandler))       // Multiple addresses
 	
 	// Asset endpoints
 	http.HandleFunc("/assets/", authHandler(func(w http.ResponseWriter, r *http.Request) {
@@ -281,6 +299,15 @@ func main() {
 	
 	// Epoch endpoints
 	http.HandleFunc("/epochs/latest", authHandler(getCurrentEpochHandler))
+	
+	// PREEBOT-optimized endpoints (high-performance polling for Discord bot)
+	http.HandleFunc("/preebot/asset-changes", authHandler(preebotAssetChangesHandler))     // 5-minute polling for holding changes
+	http.HandleFunc("/preebot/nft-mints", authHandler(preebotNFTMintsHandler))           // 1-minute polling for new mints
+	http.HandleFunc("/preebot/token-value", authHandler(preebotTokenValueHandler))       // On-demand token stats (cached)
+	http.HandleFunc("/preebot/token-price", authHandler(preebotTokenPriceHandler))       // 5-minute polling for LIGHTNING FAST prices
+	http.HandleFunc("/preebot/asset-holdings", authHandler(preebotAssetHoldingsHandler)) // LIGHTNING FAST holdings lookup
+	http.HandleFunc("/preebot/asset-transfers", authHandler(preebotAssetTransfersHandler)) // 1-minute polling for purchases
+	http.HandleFunc("/preebot/refresh-cache", authHandler(preebotRefreshCacheHandler))   // Cache management for token stats
 	
 	// Legacy endpoints (also protected)
 	registerRoute("/nft-owners", "Get address → NFT count for a specific policy ID.", "/nft-owners?policy_id=<your_policy_id>", authHandler(nftOwnersHandler))

@@ -39,22 +39,34 @@ func getAddressTransactionsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := `
-		SELECT DISTINCT encode(t.hash, 'hex') as tx_hash, t.block_index, b.block_no, 
-			   EXTRACT(EPOCH FROM b.time)::bigint as block_time
-		FROM tx t
-		JOIN block b ON t.block_id = b.id
-		JOIN tx_out txo ON t.id = txo.tx_id
-		JOIN address addr ON txo.address_id = addr.id
-		WHERE addr.address = $1
-		UNION
-		SELECT DISTINCT encode(t.hash, 'hex') as tx_hash, t.block_index, b.block_no,
-			   EXTRACT(EPOCH FROM b.time)::bigint as block_time
-		FROM tx t
-		JOIN block b ON t.block_id = b.id
-		JOIN tx_in txi ON t.id = txi.tx_in_id
-		JOIN tx_out txo ON txi.tx_out_id = txo.tx_id AND txi.tx_out_index = txo.index
-		JOIN address addr ON txo.address_id = addr.id
-		WHERE addr.address = $1
+		WITH address_id AS (
+			SELECT id FROM address WHERE address = $1
+		),
+		tx_outputs AS (
+			SELECT t.id, t.hash, t.block_index, b.block_no, 
+				   EXTRACT(EPOCH FROM b.time)::bigint as block_time
+			FROM tx t
+			JOIN block b ON t.block_id = b.id
+			JOIN tx_out txo ON t.id = txo.tx_id
+			WHERE txo.address_id = (SELECT id FROM address_id)
+		),
+		tx_inputs AS (
+			SELECT t.id, t.hash, t.block_index, b.block_no,
+				   EXTRACT(EPOCH FROM b.time)::bigint as block_time
+			FROM tx t
+			JOIN block b ON t.block_id = b.id
+			JOIN tx_in txi ON t.id = txi.tx_in_id
+			JOIN tx_out txo ON txi.tx_out_id = txo.tx_id AND txi.tx_out_index = txo.index
+			WHERE txo.address_id = (SELECT id FROM address_id)
+		)
+		SELECT encode(hash, 'hex') as tx_hash, block_index, block_no, block_time
+		FROM (
+			SELECT DISTINCT hash, block_index, block_no, block_time, id
+			FROM tx_outputs
+			UNION
+			SELECT DISTINCT hash, block_index, block_no, block_time, id
+			FROM tx_inputs
+		) combined
 		ORDER BY block_no ` + orderBy + `, block_index ` + orderBy + `
 		LIMIT $2 OFFSET $3
 	`
@@ -109,7 +121,19 @@ func getAddressUTXOsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := `
-		SELECT encode(t.hash, 'hex') as tx_hash, txo.index, txo.value,
+		WITH address_id AS (
+			SELECT id FROM address WHERE address = $1
+		),
+		unspent_utxos AS (
+			SELECT txo.id, txo.tx_id, txo.index, txo.value, t.hash
+			FROM tx_out txo
+			JOIN tx t ON txo.tx_id = t.id
+			WHERE txo.address_id = (SELECT id FROM address_id)
+			  AND txo.consumed_by_tx_id IS NULL
+			ORDER BY txo.id ` + orderBy + `
+			LIMIT $2 OFFSET $3
+		)
+		SELECT encode(u.hash, 'hex') as tx_hash, u.index, u.value,
 			   COALESCE(json_agg(
 				   CASE WHEN ma.policy IS NOT NULL THEN
 					   json_build_object(
@@ -118,16 +142,11 @@ func getAddressUTXOsHandler(w http.ResponseWriter, r *http.Request) {
 					   )
 				   END
 			   ) FILTER (WHERE ma.policy IS NOT NULL), '[]'::json) as assets
-		FROM tx_out txo
-		JOIN tx t ON txo.tx_id = t.id
-		JOIN address addr ON txo.address_id = addr.id
-		LEFT JOIN tx_in txi ON txo.tx_id = txi.tx_out_id AND txo.index = txi.tx_out_index
-		LEFT JOIN ma_tx_out mto ON mto.tx_out_id = txo.id
+		FROM unspent_utxos u
+		LEFT JOIN ma_tx_out mto ON mto.tx_out_id = u.id
 		LEFT JOIN multi_asset ma ON mto.ident = ma.id
-		WHERE addr.address = $1 AND txi.tx_in_id IS NULL
-		GROUP BY t.hash, txo.index, txo.value, txo.id
-		ORDER BY txo.id ` + orderBy + `
-		LIMIT $2 OFFSET $3
+		GROUP BY u.hash, u.index, u.value, u.id
+		ORDER BY u.id ` + orderBy + `
 	`
 
 	rows, err := db.QueryContext(ctx, query, address, count, offset)

@@ -341,33 +341,16 @@ func getAddressHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Query for address balance and UTXOs
+	// Query for address balance (optimized - ADA only first, then assets)
 	query := `
-		WITH address_utxos AS (
-			SELECT txo.value, mto.quantity, ma.policy, ma.name
-			FROM tx_out txo
-			JOIN tx ON txo.tx_id = tx.id
-			JOIN address addr ON txo.address_id = addr.id
-			LEFT JOIN tx_in txi ON txo.tx_id = txi.tx_out_id AND txo.index = txi.tx_out_index
-			LEFT JOIN ma_tx_out mto ON mto.tx_out_id = txo.id
-			LEFT JOIN multi_asset ma ON mto.ident = ma.id
-			WHERE addr.address = $1 
-			  AND txi.tx_in_id IS NULL 
-			  AND tx.valid_contract = true
-		)
 		SELECT 
-			COALESCE(SUM(CASE WHEN policy IS NULL THEN value ELSE 0 END), 0) as ada_balance,
-			json_agg(
-				CASE 
-					WHEN policy IS NOT NULL THEN 
-						json_build_object(
-							'unit', CONCAT(encode(policy, 'hex'), encode(name, 'hex')),
-							'quantity', quantity::text
-						)
-					ELSE NULL 
-				END
-			) FILTER (WHERE policy IS NOT NULL) as assets
-		FROM address_utxos
+			COALESCE(SUM(txo.value), 0) as ada_balance,
+			'[]'::json as assets
+		FROM tx_out txo
+		INNER JOIN tx ON txo.tx_id = tx.id
+		WHERE txo.address_id = (SELECT id FROM address WHERE address = $1)
+		  AND txo.consumed_by_tx_id IS NULL
+		  AND tx.valid_contract = true
 	`
 
 	var adaBalance int64
