@@ -304,27 +304,67 @@ DECLARE
     assets_count INTEGER := 0;
     trades_count INTEGER := 0;
 BEGIN
-    WITH block_trades AS (
+    -- IMPROVED: Identify actual DEX trades instead of all transfers
+    WITH multi_asset_txs AS (
+        SELECT 
+            t.id as tx_id,
+            t.hash,
+            COUNT(DISTINCT ma.policy) as unique_policies,
+            b.time
+        FROM tx t
+        JOIN block b ON t.block_id = b.id
+        JOIN tx_out txo ON txo.tx_id = t.id
+        JOIN ma_tx_out mto ON mto.tx_out_id = txo.id
+        JOIN multi_asset ma ON mto.ident = ma.id
+        WHERE b.block_no = target_block_no
+          AND t.valid_contract = true
+        GROUP BY t.id, t.hash, b.time
+        HAVING COUNT(DISTINCT ma.policy) >= 2  -- Multiple different tokens (likely DEX)
+    ),
+    block_trades AS (
         SELECT 
             encode(ma.policy, 'hex') || encode(ma.name, 'hex') as asset_id,
             encode(ma.policy, 'hex') as policy_id,
             encode(ma.name, 'hex') as asset_name,
             mto.quantity,
-            txo.value as ada_value,
-            extract(epoch from b.time)::bigint as trade_time,
-            t.id as tx_id,
-            encode(t.hash, 'hex') as tx_hash,
-            a.address
-        FROM block b
-        JOIN tx t ON t.block_id = b.id
-        JOIN tx_out txo ON txo.tx_id = t.id
+            -- Calculate ADA equivalent more accurately
+            COALESCE(
+                (SELECT SUM(plain_txo.value) 
+                 FROM tx_out plain_txo 
+                 WHERE plain_txo.tx_id = mt.tx_id 
+                   AND plain_txo.id NOT IN (SELECT tx_out_id FROM ma_tx_out WHERE tx_out_id = plain_txo.id)
+                ), txo.value
+            ) as ada_value,
+            extract(epoch from mt.time)::bigint as trade_time,
+            mt.tx_id,
+            encode(mt.hash, 'hex') as tx_hash,
+            a.address,
+            CASE 
+                WHEN mt.unique_policies >= 3 THEN 3  -- Multi-asset DEX (highest confidence)
+                WHEN mt.unique_policies = 2 THEN 2   -- Token pair trade (medium confidence)
+                ELSE 1                               -- Lower confidence
+            END as confidence_weight
+        FROM multi_asset_txs mt
+        JOIN tx_out txo ON txo.tx_id = mt.tx_id
         JOIN address a ON txo.address_id = a.id
         JOIN ma_tx_out mto ON mto.tx_out_id = txo.id
         JOIN multi_asset ma ON mto.ident = ma.id
-        WHERE b.block_no = target_block_no
-          AND t.valid_contract = true
-          AND mto.quantity > 0
-          AND txo.value > 1000000
+        WHERE mto.quantity > 0
+          AND COALESCE(
+                (SELECT SUM(plain_txo.value) 
+                 FROM tx_out plain_txo 
+                 WHERE plain_txo.tx_id = mt.tx_id 
+                   AND plain_txo.id NOT IN (SELECT tx_out_id FROM ma_tx_out WHERE tx_out_id = plain_txo.id)
+                ), txo.value
+            ) > 1000000  -- At least 1 ADA
+          -- Filter for reasonable price ranges
+          AND COALESCE(
+                (SELECT SUM(plain_txo.value) 
+                 FROM tx_out plain_txo 
+                 WHERE plain_txo.tx_id = mt.tx_id 
+                   AND plain_txo.id NOT IN (SELECT tx_out_id FROM ma_tx_out WHERE tx_out_id = plain_txo.id)
+                ), txo.value
+            )::numeric / mto.quantity::numeric BETWEEN 0.001 AND 100
     )
     INSERT INTO preebot_recent_activity (
         asset_id, policy_id, tx_hash, to_address, quantity, ada_value, 
@@ -332,7 +372,12 @@ BEGIN
     )
     SELECT 
         bt.asset_id, bt.policy_id, bt.tx_hash, bt.address, bt.quantity, bt.ada_value,
-        'transfer', to_timestamp(bt.trade_time), target_block_no, b.slot_no
+        CASE 
+            WHEN bt.confidence_weight = 3 THEN 'dex_multi'
+            WHEN bt.confidence_weight = 2 THEN 'dex_pair'
+            ELSE 'transfer'
+        END as activity_type,
+        to_timestamp(bt.trade_time), target_block_no, b.slot_no
     FROM block_trades bt
     JOIN block b ON b.block_no = target_block_no;
 
@@ -341,16 +386,25 @@ BEGIN
     WITH price_updates AS (
         SELECT 
             asset_id, policy_id,
+            -- Volume-weighted price calculation with confidence weighting
             CASE 
-                WHEN SUM(quantity) > 0 
-                THEN (SUM(ada_value::numeric) / SUM(quantity::numeric))
+                WHEN SUM(quantity::numeric * confidence_weight) > 0 
+                THEN SUM(ada_value::numeric * confidence_weight) / SUM(quantity::numeric * confidence_weight)
                 ELSE 0
             END as new_price,
             SUM(ada_value) as volume_24h,
             COUNT(*) as trades_24h,
             MAX(extract(epoch from block_time)::bigint) as last_trade_time
-        FROM preebot_recent_activity
-        WHERE block_time >= NOW() - INTERVAL '24 hours'
+        FROM (
+            SELECT *,
+                CASE 
+                    WHEN activity_type = 'dex_multi' THEN 3
+                    WHEN activity_type = 'dex_pair' THEN 2  
+                    ELSE 1
+                END as confidence_weight
+            FROM preebot_recent_activity
+            WHERE block_time >= NOW() - INTERVAL '24 hours'
+        ) pra
         GROUP BY asset_id, policy_id
     )
     INSERT INTO preebot_token_prices (
