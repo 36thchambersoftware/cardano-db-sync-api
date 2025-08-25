@@ -304,67 +304,59 @@ DECLARE
     assets_count INTEGER := 0;
     trades_count INTEGER := 0;
 BEGIN
-    -- IMPROVED: Identify actual DEX trades instead of all transfers
-    WITH multi_asset_txs AS (
-        SELECT 
-            t.id as tx_id,
-            t.hash,
-            COUNT(DISTINCT ma.policy) as unique_policies,
-            b.time
-        FROM tx t
-        JOIN block b ON t.block_id = b.id
-        JOIN tx_out txo ON txo.tx_id = t.id
-        JOIN ma_tx_out mto ON mto.tx_out_id = txo.id
-        JOIN multi_asset ma ON mto.ident = ma.id
-        WHERE b.block_no = target_block_no
-          AND t.valid_contract = true
-        GROUP BY t.id, t.hash, b.time
-        HAVING COUNT(DISTINCT ma.policy) >= 2  -- Multiple different tokens (likely DEX)
-    ),
-    block_trades AS (
+    -- BALANCED: Find real trades while being less restrictive than pure DEX detection
+    WITH block_trades AS (
         SELECT 
             encode(ma.policy, 'hex') || encode(ma.name, 'hex') as asset_id,
             encode(ma.policy, 'hex') as policy_id,
             encode(ma.name, 'hex') as asset_name,
             mto.quantity,
-            -- Calculate ADA equivalent more accurately
-            COALESCE(
-                (SELECT SUM(plain_txo.value) 
-                 FROM tx_out plain_txo 
-                 WHERE plain_txo.tx_id = mt.tx_id 
-                   AND plain_txo.id NOT IN (SELECT tx_out_id FROM ma_tx_out WHERE tx_out_id = plain_txo.id)
-                ), txo.value
-            ) as ada_value,
-            extract(epoch from mt.time)::bigint as trade_time,
-            mt.tx_id,
-            encode(mt.hash, 'hex') as tx_hash,
+            txo.value as ada_value,
+            extract(epoch from b.time)::bigint as trade_time,
+            t.id as tx_id,
+            encode(t.hash, 'hex') as tx_hash,
             a.address,
+            -- Enhanced confidence scoring
             CASE 
-                WHEN mt.unique_policies >= 3 THEN 3  -- Multi-asset DEX (highest confidence)
-                WHEN mt.unique_policies = 2 THEN 2   -- Token pair trade (medium confidence)
-                ELSE 1                               -- Lower confidence
-            END as confidence_weight
-        FROM multi_asset_txs mt
-        JOIN tx_out txo ON txo.tx_id = mt.tx_id
+                -- High confidence: Multi-asset transactions (DEX-like)
+                WHEN (SELECT COUNT(DISTINCT ma2.policy) 
+                      FROM tx_out txo2 
+                      JOIN ma_tx_out mto2 ON mto2.tx_out_id = txo2.id 
+                      JOIN multi_asset ma2 ON mto2.ident = ma2.id 
+                      WHERE txo2.tx_id = t.id) >= 2
+                THEN 3
+                
+                -- Medium confidence: Significant ADA amounts
+                WHEN txo.value > 10000000  -- > 10 ADA
+                THEN 2
+                
+                -- Medium confidence: Reasonable price + decent ADA amount
+                WHEN txo.value::numeric / mto.quantity::numeric BETWEEN 0.01 AND 10.0
+                  AND txo.value > 2000000  -- > 2 ADA
+                THEN 2
+                
+                -- Low confidence
+                ELSE 1
+            END as confidence_weight,
+            
+            -- Filter obvious non-trades
+            CASE 
+                WHEN txo.value::numeric / mto.quantity::numeric < 0.001 THEN true  -- Dust
+                WHEN txo.value::numeric / mto.quantity::numeric > 50 THEN true     -- Unrealistic
+                WHEN txo.value < 500000 THEN true                                  -- < 0.5 ADA
+                ELSE false
+            END as likely_non_trade
+            
+        FROM block b
+        JOIN tx t ON t.block_id = b.id
+        JOIN tx_out txo ON txo.tx_id = t.id
         JOIN address a ON txo.address_id = a.id
         JOIN ma_tx_out mto ON mto.tx_out_id = txo.id
         JOIN multi_asset ma ON mto.ident = ma.id
-        WHERE mto.quantity > 0
-          AND COALESCE(
-                (SELECT SUM(plain_txo.value) 
-                 FROM tx_out plain_txo 
-                 WHERE plain_txo.tx_id = mt.tx_id 
-                   AND plain_txo.id NOT IN (SELECT tx_out_id FROM ma_tx_out WHERE tx_out_id = plain_txo.id)
-                ), txo.value
-            ) > 1000000  -- At least 1 ADA
-          -- Filter for reasonable price ranges
-          AND COALESCE(
-                (SELECT SUM(plain_txo.value) 
-                 FROM tx_out plain_txo 
-                 WHERE plain_txo.tx_id = mt.tx_id 
-                   AND plain_txo.id NOT IN (SELECT tx_out_id FROM ma_tx_out WHERE tx_out_id = plain_txo.id)
-                ), txo.value
-            )::numeric / mto.quantity::numeric BETWEEN 0.001 AND 100
+        WHERE b.block_no = target_block_no
+          AND t.valid_contract = true
+          AND mto.quantity > 0
+          AND txo.value > 100000  -- At least 0.1 ADA
     )
     INSERT INTO preebot_recent_activity (
         asset_id, policy_id, tx_hash, to_address, quantity, ada_value, 
@@ -379,7 +371,8 @@ BEGIN
         END as activity_type,
         to_timestamp(bt.trade_time), target_block_no, b.slot_no
     FROM block_trades bt
-    JOIN block b ON b.block_no = target_block_no;
+    JOIN block b ON b.block_no = target_block_no
+    WHERE bt.likely_non_trade = false AND bt.confidence_weight >= 2;
 
     GET DIAGNOSTICS trades_count = ROW_COUNT;
 
