@@ -133,15 +133,13 @@ WHERE consumed_by_tx_id IS NULL;
 -- ========================================
 -- Critical indexes to fix 16+ minute token value queries
 
--- CRITICAL: Policy hex lookups (replaces slow encode() operations in WHERE clauses)
+-- CRITICAL: Policy binary lookups (avoid encode() functions in indexes)
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_multi_asset_policy_hex 
-ON multi_asset (encode(policy, 'hex'))
+ON multi_asset (policy)
 INCLUDE (id, name);
 
--- Policy + name hex lookup for specific assets
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_multi_asset_policy_name_hex
-ON multi_asset (encode(policy, 'hex'), encode(name, 'hex'))
-INCLUDE (id);
+-- Policy + name binary lookup for specific assets (removed - too large for btree)
+-- Use policy index + filter instead of composite index
 
 -- CRITICAL: Asset quantity lookups with included columns
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_ma_tx_out_token_fast
@@ -154,20 +152,19 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tx_out_unspent_supply
 ON tx_out (consumed_by_tx_id, address_id, tx_id, id)
 WHERE consumed_by_tx_id IS NULL;
 
--- Time-based queries for daily volume (only index recent data)
+-- Time-based queries for daily volume (removed NOW() - cannot be used in partial indexes)
+-- Use full time index instead
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_block_time_recent
-ON block (time DESC)
-WHERE time >= NOW() - INTERVAL '7 days';
+ON block (time DESC);
 
 -- ========================================
 -- REAL-TIME PRICE QUERY INDEXES
 -- ========================================
 -- Optimized for PREEBOT's 5-minute price polling (no cache)
 
--- CRITICAL: Time-based trading activity queries (last 48 hours)
+-- CRITICAL: Time-based trading activity queries (removed NOW() - use full index)
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_block_recent_trading
-ON block (time DESC)
-WHERE time >= NOW() - INTERVAL '7 days';
+ON block (time DESC);
 
 -- Price discovery from recent trades (value + quantity correlation)
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tx_out_price_discovery
