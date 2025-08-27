@@ -305,9 +305,11 @@ func main() {
 	http.HandleFunc("/preebot/nft-mints", authHandler(preebotNFTMintsHandler))           // 1-minute polling for new mints
 	http.HandleFunc("/preebot/token-value", authHandler(preebotTokenValueHandler))       // On-demand token stats (cached)
 	http.HandleFunc("/preebot/token-price", authHandler(preebotTokenPriceHandler))       // 5-minute polling for LIGHTNING FAST prices
-	http.HandleFunc("/preebot/asset-holdings", authHandler(preebotAssetHoldingsHandler)) // LIGHTNING FAST holdings lookup
+	http.HandleFunc("/preebot/asset-holdings", authHandler(preebotAssetHoldingsHandler)) // LIGHTNING FAST holdings lookup with NFT metadata
+	http.HandleFunc("/preebot/nft-traits", authHandler(preebotNFTTraitsHandler))         // NFT trait queries for Discord role assignment
 	http.HandleFunc("/preebot/asset-transfers", authHandler(preebotAssetTransfersHandler)) // 1-minute polling for purchases
 	http.HandleFunc("/preebot/refresh-cache", authHandler(preebotRefreshCacheHandler))   // Cache management for token stats
+	http.HandleFunc("/preebot/cache-nft-metadata", authHandler(preebotCacheNFTMetadataHandler)) // Populate NFT metadata cache for Discord
 	
 	// Legacy endpoints (also protected)
 	registerRoute("/nft-owners", "Get address → NFT count for a specific policy ID.", "/nft-owners?policy_id=<your_policy_id>", authHandler(nftOwnersHandler))

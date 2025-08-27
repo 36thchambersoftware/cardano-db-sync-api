@@ -301,7 +301,7 @@ DECLARE
     assets_count INTEGER := 0;
     trades_count INTEGER := 0;
 BEGIN
-    -- BALANCED: Find real trades while being less restrictive than pure DEX detection
+    -- SCRIPT-BASED: Only include transactions with script addresses (DEX contracts)
     WITH block_trades AS (
         SELECT 
             encode(ma.policy, 'hex') || encode(ma.name, 'hex') as asset_id,
@@ -313,34 +313,43 @@ BEGIN
             t.id as tx_id,
             encode(t.hash, 'hex') as tx_hash,
             a.address,
-            -- Enhanced confidence scoring
+            -- TOKEN ↔ ADA swap confidence scoring
             CASE 
-                -- High confidence: Multi-asset transactions (DEX-like)
+                -- High confidence: Single token policy + script (pure TOKEN ↔ ADA swap)
                 WHEN (SELECT COUNT(DISTINCT ma2.policy) 
                       FROM tx_out txo2 
                       JOIN ma_tx_out mto2 ON mto2.tx_out_id = txo2.id 
                       JOIN multi_asset ma2 ON mto2.ident = ma2.id 
-                      WHERE txo2.tx_id = t.id) >= 2
+                      WHERE txo2.tx_id = t.id) = 1
+                  AND a.has_script = true
+                  AND (SELECT COUNT(*) FROM tx_out WHERE tx_id = t.id) BETWEEN 2 AND 4
                 THEN 3
                 
-                -- Medium confidence: Significant ADA amounts
-                WHEN txo.value > 10000000  -- > 10 ADA
+                -- Medium confidence: Script address with reasonable characteristics
+                WHEN a.has_script = true 
+                  AND txo.value > 1000000  -- > 1 ADA
+                  AND txo.value::numeric / mto.quantity::numeric BETWEEN 0.0001 AND 10.0
                 THEN 2
                 
-                -- Medium confidence: Reasonable price + decent ADA amount
-                WHEN txo.value::numeric / mto.quantity::numeric BETWEEN 0.01 AND 10.0
-                  AND txo.value > 2000000  -- > 2 ADA
-                THEN 2
-                
-                -- Low confidence
+                -- Low confidence: Everything else
                 ELSE 1
             END as confidence_weight,
             
-            -- Filter obvious non-trades
+            -- Filter non-swap transactions (focus on TOKEN ↔ ADA only)
             CASE 
-                WHEN txo.value::numeric / mto.quantity::numeric < 0.001 THEN true  -- Dust
-                WHEN txo.value::numeric / mto.quantity::numeric > 50 THEN true     -- Unrealistic
-                WHEN txo.value < 500000 THEN true                                  -- < 0.5 ADA
+                WHEN a.has_script = false THEN true  -- Not script address = not DEX
+                -- Multi-token transactions are likely LP/complex operations, not simple swaps
+                WHEN (SELECT COUNT(DISTINCT ma2.policy) 
+                      FROM tx_out txo2 
+                      JOIN ma_tx_out mto2 ON mto2.tx_out_id = txo2.id 
+                      JOIN multi_asset ma2 ON mto2.ident = ma2.id 
+                      WHERE txo2.tx_id = t.id) > 1 THEN true
+                WHEN txo.value::numeric / mto.quantity::numeric < 0.0001 THEN true -- Dust
+                WHEN txo.value::numeric / mto.quantity::numeric > 10 THEN true     -- Unrealistic for swaps
+                WHEN txo.value < 100000 THEN true                                  -- < 0.1 ADA
+                WHEN mto.quantity < 1000 THEN true                                 -- Dust quantity
+                -- Complex transactions are likely not simple swaps
+                WHEN (SELECT COUNT(*) FROM tx_out WHERE tx_id = t.id) > 4 THEN true
                 ELSE false
             END as likely_non_trade
             
@@ -353,7 +362,8 @@ BEGIN
         WHERE b.block_no = target_block_no
           AND t.valid_contract = true
           AND mto.quantity > 0
-          AND txo.value > 100000  -- At least 0.1 ADA
+          AND txo.value > 1000000  -- At least 1 ADA
+          AND a.has_script = true  -- ONLY script addresses (DEX contracts)
     )
     INSERT INTO preebot_recent_activity (
         asset_id, policy_id, tx_hash, to_address, quantity, ada_value, 
@@ -605,5 +615,130 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- ========================================
+-- NFT METADATA OPTIMIZATION INDEXES
+-- ========================================
+-- Critical indexes for fast NFT metadata and trait queries (Discord role assignment)
+
+-- CRITICAL: TX metadata lookups by transaction ID and key (CIP-25 standard)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tx_metadata_tx_key 
+ON tx_metadata (tx_id, key)
+WHERE key = 721;
+
+-- CRITICAL: Multi-asset first mint transaction lookup
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_ma_tx_out_first_mint
+ON ma_tx_out (ident, tx_out_id)
+WHERE quantity > 0;
+
+-- NFT-focused asset holdings (quantity <= 10 for likely NFTs)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_preebot_holdings_nft
+ON preebot_asset_holdings (address, quantity)
+WHERE quantity > 0 AND quantity <= 10;
+
+-- Fast policy-based NFT lookups for Discord role assignment
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_preebot_holdings_policy_nft
+ON preebot_asset_holdings (policy_id, address)
+WHERE quantity > 0 AND quantity <= 10;
+
+-- ========================================
+-- PREEBOT NFT METADATA CACHE TABLE
+-- ========================================
+-- Lightning-fast NFT metadata cache for Discord bot queries
+
+CREATE TABLE IF NOT EXISTS preebot_nft_metadata (
+    asset_id TEXT PRIMARY KEY,
+    policy_id TEXT NOT NULL,
+    asset_name TEXT,
+    metadata JSONB,
+    traits JSONB,
+    collection_name TEXT,
+    nft_name TEXT,
+    image_url TEXT,
+    first_mint_tx TEXT,
+    cache_updated BIGINT DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_nft_metadata_policy ON preebot_nft_metadata (policy_id);
+CREATE INDEX IF NOT EXISTS idx_nft_metadata_traits ON preebot_nft_metadata USING gin (traits);
+CREATE INDEX IF NOT EXISTS idx_nft_metadata_collection ON preebot_nft_metadata (collection_name);
+CREATE INDEX IF NOT EXISTS idx_nft_metadata_updated ON preebot_nft_metadata (cache_updated);
+
+-- Function to populate NFT metadata cache for a specific policy
+CREATE OR REPLACE FUNCTION cache_nft_metadata_for_policy(target_policy TEXT)
+RETURNS INTEGER AS $$
+DECLARE
+    cached_count INTEGER := 0;
+BEGIN
+    INSERT INTO preebot_nft_metadata (
+        asset_id, policy_id, asset_name, metadata, traits, collection_name, 
+        nft_name, image_url, first_mint_tx, cache_updated
+    )
+    SELECT 
+        encode(ma.policy, 'hex') || encode(ma.name, 'hex') as asset_id,
+        encode(ma.policy, 'hex') as policy_id,
+        encode(ma.name, 'hex') as asset_name,
+        COALESCE(tm.json, '{}'::jsonb) as metadata,
+        COALESCE(
+            -- Extract traits from CIP-25 metadata
+            CASE 
+                WHEN tm.json ? encode(ma.policy, 'hex') THEN
+                    COALESCE(
+                        tm.json->encode(ma.policy, 'hex')->encode(ma.name, 'hex')->>'attributes',
+                        tm.json->encode(ma.policy, 'hex')->encode(ma.name, 'hex')->>'traits',
+                        tm.json->encode(ma.policy, 'hex')->''->'attributes',
+                        '{}'::jsonb
+                    )
+                ELSE '{}'::jsonb
+            END, '{}'::jsonb
+        ) as traits,
+        -- Collection name extraction
+        COALESCE(
+            tm.json->encode(ma.policy, 'hex')->encode(ma.name, 'hex')->>'name',
+            tm.json->encode(ma.policy, 'hex')->''->'name'
+        ) as collection_name,
+        -- NFT name
+        COALESCE(
+            tm.json->encode(ma.policy, 'hex')->encode(ma.name, 'hex')->>'name',
+            tm.json->encode(ma.policy, 'hex')->''->'name'
+        ) as nft_name,
+        -- Image URL
+        COALESCE(
+            tm.json->encode(ma.policy, 'hex')->encode(ma.name, 'hex')->>'image',
+            tm.json->encode(ma.policy, 'hex')->''->'image'
+        ) as image_url,
+        encode(t.hash, 'hex') as first_mint_tx,
+        extract(epoch from NOW())::bigint as cache_updated
+    FROM (
+        -- Find the first minting transaction for each asset
+        SELECT DISTINCT ON (ma.id)
+            ma.id, ma.policy, ma.name, t.id as tx_id, t.hash
+        FROM multi_asset ma
+        JOIN ma_tx_out mto ON ma.id = mto.ident
+        JOIN tx_out txo ON mto.tx_out_id = txo.id
+        JOIN tx t ON txo.tx_id = t.id
+        WHERE encode(ma.policy, 'hex') = target_policy
+          AND mto.quantity > 0
+          AND t.valid_contract = true
+        ORDER BY ma.id, t.id ASC  -- First transaction = mint
+    ) first_mints
+    JOIN multi_asset ma ON ma.id = first_mints.id
+    JOIN tx t ON t.id = first_mints.tx_id
+    LEFT JOIN tx_metadata tm ON tm.tx_id = t.id AND tm.key = 721  -- CIP-25
+    ON CONFLICT (asset_id) DO UPDATE SET
+        metadata = EXCLUDED.metadata,
+        traits = EXCLUDED.traits,
+        collection_name = EXCLUDED.collection_name,
+        nft_name = EXCLUDED.nft_name,
+        image_url = EXCLUDED.image_url,
+        cache_updated = EXCLUDED.cache_updated;
+
+    GET DIAGNOSTICS cached_count = ROW_COUNT;
+    RETURN cached_count;
+
+EXCEPTION WHEN OTHERS THEN
+    RAISE EXCEPTION 'Failed to cache NFT metadata for policy %: %', target_policy, SQLERRM;
+END;
+$$ LANGUAGE plpgsql;
+
 -- Update statistics after creating indexes and tables
--- Run: ANALYZE address, tx_out, tx, multi_asset, ma_tx_out, block, preebot_token_prices, preebot_asset_holdings, preebot_recent_activity;
+-- Run: ANALYZE address, tx_out, tx, multi_asset, ma_tx_out, block, tx_metadata, preebot_token_prices, preebot_asset_holdings, preebot_recent_activity, preebot_nft_metadata;

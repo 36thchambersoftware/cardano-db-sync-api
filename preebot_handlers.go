@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -869,21 +870,38 @@ func preebotAssetHoldingsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Get live asset holdings - LIGHTNING FAST using live tracking table
+// Get live asset holdings - LIGHTNING FAST using live tracking table with NFT metadata
 func getAssetHoldingsLive(address string) ([]map[string]interface{}, error) {
-	// ULTRA-FAST QUERY: Direct lookup from live holdings table
+	// ULTRA-FAST QUERY: Direct lookup from live holdings table with metadata
 	query := `
 		SELECT 
-			asset_id,
-			policy_id,
-			asset_name,
-			quantity,
-			last_tx_hash,
-			last_updated_block,
-			extract(epoch from updated_at)::bigint as updated_timestamp
-		FROM preebot_asset_holdings
-		WHERE address = $1 AND quantity > 0
-		ORDER BY quantity DESC
+			pah.asset_id,
+			pah.policy_id,
+			pah.asset_name,
+			pah.quantity,
+			pah.last_tx_hash,
+			pah.last_updated_block,
+			extract(epoch from pah.updated_at)::bigint as updated_timestamp,
+			-- Get NFT metadata from the original minting transaction
+			COALESCE(tm.json, '{}'::jsonb) as metadata
+		FROM preebot_asset_holdings pah
+		LEFT JOIN (
+			-- Find the original minting tx for metadata lookup
+			SELECT DISTINCT ON (ma.id) 
+				ma.id as multi_asset_id,
+				t.id as tx_id,
+				encode(ma.policy, 'hex') || encode(ma.name, 'hex') as asset_id
+			FROM multi_asset ma
+			JOIN ma_tx_out mto ON ma.id = mto.ident
+			JOIN tx_out txo ON mto.tx_out_id = txo.id
+			JOIN tx t ON txo.tx_id = t.id
+			WHERE mto.quantity > 0
+			ORDER BY ma.id, t.id ASC  -- First transaction = mint
+		) mint_lookup ON mint_lookup.asset_id = pah.asset_id
+		LEFT JOIN tx_metadata tm ON tm.tx_id = mint_lookup.tx_id 
+			AND tm.key = 721  -- CIP-25 NFT metadata standard
+		WHERE pah.address = $1 AND pah.quantity > 0
+		ORDER BY pah.quantity DESC
 		LIMIT 1000
 	`
 
@@ -897,8 +915,9 @@ func getAssetHoldingsLive(address string) ([]map[string]interface{}, error) {
 	for rows.Next() {
 		var assetID, policyID, assetName, lastTxHash string
 		var quantity, lastBlock, timestamp int64
+		var metadataBytes []byte
 
-		if err := rows.Scan(&assetID, &policyID, &assetName, &quantity, &lastTxHash, &lastBlock, &timestamp); err != nil {
+		if err := rows.Scan(&assetID, &policyID, &assetName, &quantity, &lastTxHash, &lastBlock, &timestamp, &metadataBytes); err != nil {
 			continue
 		}
 
@@ -912,8 +931,365 @@ func getAssetHoldingsLive(address string) ([]map[string]interface{}, error) {
 			"timestamp":          timestamp,
 		}
 
+		// Parse and extract NFT metadata/traits
+		if len(metadataBytes) > 0 {
+			var metadata map[string]interface{}
+			if err := json.Unmarshal(metadataBytes, &metadata); err == nil {
+				holding["metadata"] = metadata
+				
+				// Extract traits for Discord role assignment
+				if traits := extractNFTTraits(metadata, policyID, assetName); len(traits) > 0 {
+					holding["traits"] = traits
+				}
+				
+				// Add useful NFT info
+				if nftInfo := extractNFTInfo(metadata, policyID); nftInfo != nil {
+					holding["nft_info"] = nftInfo
+				}
+			}
+		}
+
 		holdings = append(holdings, holding)
 	}
 
 	return holdings, nil
+}
+
+// Extract NFT traits from CIP-25 metadata for Discord role assignment
+func extractNFTTraits(metadata map[string]interface{}, policyID, assetName string) map[string]interface{} {
+	traits := make(map[string]interface{})
+	
+	// Navigate CIP-25 structure: metadata[policy_id][asset_name]
+	if policyData, ok := metadata[policyID].(map[string]interface{}); ok {
+		var assetData map[string]interface{}
+		
+		// Try with asset name, then without (some use empty string)
+		if asset, exists := policyData[assetName].(map[string]interface{}); exists {
+			assetData = asset
+		} else if asset, exists := policyData[""].(map[string]interface{}); exists {
+			assetData = asset
+		}
+		
+		if assetData != nil {
+			// Standard CIP-25 attributes
+			if attrs, ok := assetData["attributes"].(map[string]interface{}); ok {
+				for key, value := range attrs {
+					traits[key] = value
+				}
+			}
+			
+			// Alternative structure: traits array
+			if traitsArray, ok := assetData["traits"].([]interface{}); ok {
+				for _, trait := range traitsArray {
+					if traitMap, ok := trait.(map[string]interface{}); ok {
+						if name, ok := traitMap["trait_type"].(string); ok {
+							traits[name] = traitMap["value"]
+						}
+					}
+				}
+			}
+			
+			// Common properties that might be useful for roles
+			if name, ok := assetData["name"].(string); ok {
+				traits["name"] = name
+			}
+			if description, ok := assetData["description"].(string); ok {
+				traits["description"] = description
+			}
+		}
+	}
+	
+	return traits
+}
+
+// Extract basic NFT information
+func extractNFTInfo(metadata map[string]interface{}, policyID string) map[string]interface{} {
+	if policyData, ok := metadata[policyID].(map[string]interface{}); ok {
+		info := make(map[string]interface{})
+		
+		// Count assets in this policy (collection size indication)
+		info["collection_size"] = len(policyData)
+		
+		// Look for collection-level metadata
+		for _, assetDataInterface := range policyData {
+			if assetData, ok := assetDataInterface.(map[string]interface{}); ok {
+				if name, ok := assetData["name"].(string); ok {
+					info["collection_name"] = name
+					break // Take the first name found
+				}
+			}
+		}
+		
+		if len(info) > 0 {
+			return info
+		}
+	}
+	
+	return nil
+}
+
+// PREEBOT NFT Traits - Discord role assignment optimized endpoint
+// GET /preebot/nft-traits?address=<address>&policies=<policy1,policy2>&traits=<trait1:value1,trait2:value2>
+// POST for multiple addresses: {"addresses": ["addr1", "addr2"], "policies": ["policy1"], "required_traits": {"rarity": "legendary"}}
+func preebotNFTTraitsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		// Single address trait query
+		address := r.URL.Query().Get("address")
+		if address == "" {
+			writeError(w, http.StatusBadRequest, "address parameter required")
+			return
+		}
+
+		// Optional policy filter
+		policiesParam := r.URL.Query().Get("policies")
+		var policyFilter []string
+		if policiesParam != "" {
+			policyFilter = strings.Split(policiesParam, ",")
+		}
+
+		// Optional trait filter for role assignment
+		traitsParam := r.URL.Query().Get("traits")
+		requiredTraits := make(map[string]string)
+		if traitsParam != "" {
+			for _, traitPair := range strings.Split(traitsParam, ",") {
+				if parts := strings.Split(traitPair, ":"); len(parts) == 2 {
+					requiredTraits[parts[0]] = parts[1]
+				}
+			}
+		}
+
+		result, err := getNFTTraitsForAddress(address, policyFilter, requiredTraits)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to get NFT traits: "+err.Error())
+			return
+		}
+
+		writeJSON(w, result)
+	} else if r.Method == "POST" {
+		// Batch trait query for multiple addresses
+		var request struct {
+			Addresses      []string          `json:"addresses"`
+			Policies       []string          `json:"policies,omitempty"`
+			RequiredTraits map[string]string `json:"required_traits,omitempty"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeError(w, http.StatusBadRequest, "Invalid JSON body")
+			return
+		}
+
+		if len(request.Addresses) == 0 || len(request.Addresses) > 50 {
+			writeError(w, http.StatusBadRequest, "Provide 1-50 addresses")
+			return
+		}
+
+		results := make(map[string]interface{})
+		for _, address := range request.Addresses {
+			if result, err := getNFTTraitsForAddress(address, request.Policies, request.RequiredTraits); err == nil {
+				results[address] = result
+			}
+		}
+
+		response := map[string]interface{}{
+			"results":   results,
+			"count":     len(results),
+			"timestamp": time.Now().Unix(),
+		}
+
+		writeJSON(w, response)
+	} else {
+		writeError(w, http.StatusMethodNotAllowed, "GET or POST method required")
+	}
+}
+
+// Get NFT traits for a specific address with filtering for Discord role assignment
+func getNFTTraitsForAddress(address string, policyFilter []string, requiredTraits map[string]string) (map[string]interface{}, error) {
+	// Ultra-fast query focusing on NFTs (quantity = 1) with metadata
+	query := `
+		SELECT 
+			pah.asset_id,
+			pah.policy_id,
+			pah.asset_name,
+			pah.quantity,
+			-- Get NFT metadata from the original minting transaction
+			COALESCE(tm.json, '{}'::jsonb) as metadata
+		FROM preebot_asset_holdings pah
+		LEFT JOIN (
+			-- Find the original minting tx for metadata lookup
+			SELECT DISTINCT ON (ma.id) 
+				ma.id as multi_asset_id,
+				t.id as tx_id,
+				encode(ma.policy, 'hex') || encode(ma.name, 'hex') as asset_id
+			FROM multi_asset ma
+			JOIN ma_tx_out mto ON ma.id = mto.ident
+			JOIN tx_out txo ON mto.tx_out_id = txo.id
+			JOIN tx t ON txo.tx_id = t.id
+			WHERE mto.quantity > 0
+			ORDER BY ma.id, t.id ASC  -- First transaction = mint
+		) mint_lookup ON mint_lookup.asset_id = pah.asset_id
+		LEFT JOIN tx_metadata tm ON tm.tx_id = mint_lookup.tx_id 
+			AND tm.key = 721  -- CIP-25 NFT metadata standard
+		WHERE pah.address = $1 
+		  AND pah.quantity > 0
+		  AND pah.quantity <= 10  -- Focus on likely NFTs (not fungible tokens)
+		ORDER BY pah.policy_id, pah.asset_name
+	`
+
+	rows, err := db.QueryContext(ctx, query, address)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var matchingNFTs []map[string]interface{}
+	var allNFTs []map[string]interface{}
+
+	for rows.Next() {
+		var assetID, policyID, assetName string
+		var quantity int64
+		var metadataBytes []byte
+
+		if err := rows.Scan(&assetID, &policyID, &assetName, &quantity, &metadataBytes); err != nil {
+			continue
+		}
+
+		// Apply policy filter if specified
+		if len(policyFilter) > 0 {
+			found := false
+			for _, policy := range policyFilter {
+				if policy == policyID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		}
+
+		nft := map[string]interface{}{
+			"asset_id":   assetID,
+			"policy_id":  policyID,
+			"asset_name": assetName,
+			"quantity":   quantity,
+		}
+
+		// Parse metadata and extract traits
+		if len(metadataBytes) > 0 {
+			var metadata map[string]interface{}
+			if err := json.Unmarshal(metadataBytes, &metadata); err == nil {
+				if traits := extractNFTTraits(metadata, policyID, assetName); len(traits) > 0 {
+					nft["traits"] = traits
+
+					// Check if this NFT matches required traits for Discord roles
+					matchesRequiredTraits := true
+					if len(requiredTraits) > 0 {
+						for requiredTrait, requiredValue := range requiredTraits {
+							if traitValue, exists := traits[requiredTrait]; !exists || 
+								!strings.EqualFold(fmt.Sprintf("%v", traitValue), requiredValue) {
+								matchesRequiredTraits = false
+								break
+							}
+						}
+					}
+
+					if matchesRequiredTraits {
+						matchingNFTs = append(matchingNFTs, nft)
+					}
+				}
+			}
+		}
+
+		allNFTs = append(allNFTs, nft)
+	}
+
+	// Summary for Discord role assignment
+	result := map[string]interface{}{
+		"address":       address,
+		"total_nfts":    len(allNFTs),
+		"matching_nfts": len(matchingNFTs),
+		"nfts":          matchingNFTs, // Only return NFTs that match criteria
+		"timestamp":     time.Now().Unix(),
+	}
+
+	// Add policy summary for role assignment logic
+	policyCount := make(map[string]int)
+	for _, nft := range matchingNFTs {
+		if policyID, ok := nft["policy_id"].(string); ok {
+			policyCount[policyID]++
+		}
+	}
+	if len(policyCount) > 0 {
+		result["policy_counts"] = policyCount
+	}
+
+	// Add filtering criteria to response
+	if len(policyFilter) > 0 {
+		result["filtered_policies"] = policyFilter
+	}
+	if len(requiredTraits) > 0 {
+		result["required_traits"] = requiredTraits
+	}
+
+	return result, nil
+}
+
+// PREEBOT Cache NFT Metadata - Populate metadata cache for specific policies (Discord optimization)
+// POST /preebot/cache-nft-metadata with {"policy_ids": ["policy1", "policy2"]}
+func preebotCacheNFTMetadataHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeError(w, http.StatusMethodNotAllowed, "POST method required")
+		return
+	}
+
+	var request struct {
+		PolicyIDs []string `json:"policy_ids"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid JSON body")
+		return
+	}
+
+	if len(request.PolicyIDs) == 0 || len(request.PolicyIDs) > 10 {
+		writeError(w, http.StatusBadRequest, "Provide 1-10 policy_ids")
+		return
+	}
+
+	results := make(map[string]interface{})
+	successCount := 0
+	totalCached := 0
+
+	for _, policyID := range request.PolicyIDs {
+		// Cache metadata for this policy
+		cacheQuery := `SELECT cache_nft_metadata_for_policy($1)`
+		
+		var cachedCount int
+		err := db.QueryRowContext(ctx, cacheQuery, policyID).Scan(&cachedCount)
+		if err != nil {
+			results[policyID] = map[string]interface{}{
+				"success": false,
+				"error":   "Failed to cache metadata: " + err.Error(),
+				"cached":  0,
+			}
+			continue
+		}
+
+		results[policyID] = map[string]interface{}{
+			"success": true,
+			"cached":  cachedCount,
+		}
+		successCount++
+		totalCached += cachedCount
+	}
+
+	response := map[string]interface{}{
+		"results":        results,
+		"total_policies": len(request.PolicyIDs),
+		"successful":     successCount,
+		"total_cached":   totalCached,
+		"timestamp":      time.Now().Unix(),
+	}
+
+	writeJSON(w, response)
 }
