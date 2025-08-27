@@ -872,7 +872,18 @@ func preebotAssetHoldingsHandler(w http.ResponseWriter, r *http.Request) {
 
 // Get live asset holdings - LIGHTNING FAST using live tracking table with NFT metadata
 func getAssetHoldingsLive(address string) ([]map[string]interface{}, error) {
-	// ULTRA-FAST QUERY: Direct lookup from live holdings table with metadata
+	// First try the optimized live tracking table
+	holdings, err := getAssetHoldingsFromCache(address)
+	if err == nil && len(holdings) > 0 {
+		return holdings, nil
+	}
+
+	// Fallback: Query main database directly (slower but works immediately)
+	return getAssetHoldingsFromMainDB(address)
+}
+
+// Get holdings from live tracking table (fastest)
+func getAssetHoldingsFromCache(address string) ([]map[string]interface{}, error) {
 	query := `
 		SELECT 
 			pah.asset_id,
@@ -905,6 +916,106 @@ func getAssetHoldingsLive(address string) ([]map[string]interface{}, error) {
 		LIMIT 1000
 	`
 
+	return executeHoldingsQuery(query, address)
+}
+
+// Get holdings directly from main database (fallback)
+func getAssetHoldingsFromMainDB(address string) ([]map[string]interface{}, error) {
+	// Direct query to main cardano-db-sync tables
+	query := `
+		WITH address_utxos AS (
+			SELECT 
+				encode(ma.policy, 'hex') || encode(ma.name, 'hex') as asset_id,
+				encode(ma.policy, 'hex') as policy_id,
+				encode(ma.name, 'hex') as asset_name,
+				SUM(mto.quantity) as total_quantity,
+				-- Get NFT metadata from first minting transaction
+				FIRST_VALUE(tm.json) OVER (
+					PARTITION BY ma.id 
+					ORDER BY t.id ASC 
+					ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+				) as metadata,
+				MAX(encode(t.hash, 'hex')) as latest_tx_hash,
+				MAX(extract(epoch from b.time)::bigint) as timestamp
+			FROM address a
+			JOIN tx_out txo ON a.id = txo.address_id
+			JOIN ma_tx_out mto ON txo.id = mto.tx_out_id
+			JOIN multi_asset ma ON mto.ident = ma.id
+			JOIN tx t ON txo.tx_id = t.id
+			JOIN block b ON t.block_id = b.id
+			LEFT JOIN tx_metadata tm ON t.id = tm.tx_id AND tm.key = 721
+			WHERE a.address = $1
+			  AND txo.consumed_by_tx_id IS NULL  -- Only unspent outputs
+			  AND t.valid_contract = true
+			  AND mto.quantity > 0
+			GROUP BY ma.id, ma.policy, ma.name
+			HAVING SUM(mto.quantity) > 0
+		)
+		SELECT 
+			asset_id,
+			policy_id,
+			asset_name,
+			total_quantity,
+			COALESCE(metadata, '{}'::jsonb) as metadata,
+			latest_tx_hash,
+			timestamp
+		FROM address_utxos
+		ORDER BY total_quantity DESC
+		LIMIT 1000
+	`
+
+	rows, err := db.QueryContext(ctx, query, address)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var holdings []map[string]interface{}
+	for rows.Next() {
+		var assetID, policyID, assetName, lastTxHash string
+		var quantity, timestamp int64
+		var metadataBytes []byte
+
+		if err := rows.Scan(&assetID, &policyID, &assetName, &quantity, &metadataBytes, &lastTxHash, &timestamp); err != nil {
+			continue
+		}
+
+		holding := map[string]interface{}{
+			"asset_id":     assetID,
+			"policy_id":    policyID,
+			"asset_name":   assetName,
+			"quantity":     strconv.FormatInt(quantity, 10),
+			"last_tx_hash": lastTxHash,
+			"timestamp":    timestamp,
+			"source":       "main_db", // Indicate this came from main DB
+		}
+
+		// Parse and extract NFT metadata/traits
+		if len(metadataBytes) > 0 {
+			var metadata map[string]interface{}
+			if err := json.Unmarshal(metadataBytes, &metadata); err == nil {
+				holding["metadata"] = metadata
+				
+				// Extract traits for Discord role assignment
+				if traits := extractNFTTraits(metadata, policyID, assetName); len(traits) > 0 {
+					holding["traits"] = traits
+				}
+				
+				// Add useful NFT info
+				if nftInfo := extractNFTInfo(metadata, policyID); nftInfo != nil {
+					holding["nft_info"] = nftInfo
+				}
+			}
+		}
+
+		holdings = append(holdings, holding)
+	}
+
+	return holdings, nil
+}
+
+// Execute holdings query and parse results
+func executeHoldingsQuery(query, address string) ([]map[string]interface{}, error) {
 	rows, err := db.QueryContext(ctx, query, address)
 	if err != nil {
 		return nil, err
@@ -929,6 +1040,7 @@ func getAssetHoldingsLive(address string) ([]map[string]interface{}, error) {
 			"last_tx_hash":       lastTxHash,
 			"last_updated_block": lastBlock,
 			"timestamp":          timestamp,
+			"source":             "cache", // Indicate this came from cache
 		}
 
 		// Parse and extract NFT metadata/traits
