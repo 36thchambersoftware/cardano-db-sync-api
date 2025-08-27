@@ -872,6 +872,22 @@ func preebotAssetHoldingsHandler(w http.ResponseWriter, r *http.Request) {
 
 // Get live asset holdings - LIGHTNING FAST using live tracking table with NFT metadata
 func getAssetHoldingsLive(address string) ([]map[string]interface{}, error) {
+	// Debug: First check if address exists and has any activity at all
+	var addressExists bool
+	var totalOutputs int64
+	
+	debugQuery := `
+		SELECT 
+			COUNT(*) > 0 as address_exists,
+			COUNT(txo.id) as total_outputs
+		FROM address a
+		LEFT JOIN tx_out txo ON a.id = txo.address_id
+		WHERE a.address = $1
+		GROUP BY a.id
+	`
+	
+	db.QueryRowContext(ctx, debugQuery, address).Scan(&addressExists, &totalOutputs)
+	
 	// First try the optimized live tracking table
 	holdings, err := getAssetHoldingsFromCache(address)
 	if err == nil && len(holdings) > 0 {
@@ -879,7 +895,20 @@ func getAssetHoldingsLive(address string) ([]map[string]interface{}, error) {
 	}
 
 	// Fallback: Query main database directly (slower but works immediately)
-	return getAssetHoldingsFromMainDB(address)
+	mainHoldings, err := getAssetHoldingsFromMainDB(address)
+	if err != nil {
+		// Return debug info if query fails
+		debugHolding := map[string]interface{}{
+			"debug":         true,
+			"address_exists": addressExists,
+			"total_outputs":  totalOutputs,
+			"error":         err.Error(),
+			"source":        "debug",
+		}
+		return []map[string]interface{}{debugHolding}, nil
+	}
+	
+	return mainHoldings, nil
 }
 
 // Get holdings from live tracking table (fastest)
@@ -921,46 +950,28 @@ func getAssetHoldingsFromCache(address string) ([]map[string]interface{}, error)
 
 // Get holdings directly from main database (fallback)
 func getAssetHoldingsFromMainDB(address string) ([]map[string]interface{}, error) {
-	// Direct query to main cardano-db-sync tables
+	// Simplified direct query to main cardano-db-sync tables
 	query := `
-		WITH address_utxos AS (
-			SELECT 
-				encode(ma.policy, 'hex') || encode(ma.name, 'hex') as asset_id,
-				encode(ma.policy, 'hex') as policy_id,
-				encode(ma.name, 'hex') as asset_name,
-				SUM(mto.quantity) as total_quantity,
-				-- Get NFT metadata from first minting transaction
-				FIRST_VALUE(tm.json) OVER (
-					PARTITION BY ma.id 
-					ORDER BY t.id ASC 
-					ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-				) as metadata,
-				MAX(encode(t.hash, 'hex')) as latest_tx_hash,
-				MAX(extract(epoch from b.time)::bigint) as timestamp
-			FROM address a
-			JOIN tx_out txo ON a.id = txo.address_id
-			JOIN ma_tx_out mto ON txo.id = mto.tx_out_id
-			JOIN multi_asset ma ON mto.ident = ma.id
-			JOIN tx t ON txo.tx_id = t.id
-			JOIN block b ON t.block_id = b.id
-			LEFT JOIN tx_metadata tm ON t.id = tm.tx_id AND tm.key = 721
-			WHERE a.address = $1
-			  AND txo.consumed_by_tx_id IS NULL  -- Only unspent outputs
-			  AND t.valid_contract = true
-			  AND mto.quantity > 0
-			GROUP BY ma.id, ma.policy, ma.name
-			HAVING SUM(mto.quantity) > 0
-		)
 		SELECT 
-			asset_id,
-			policy_id,
-			asset_name,
-			total_quantity,
-			COALESCE(metadata, '{}'::jsonb) as metadata,
-			latest_tx_hash,
-			timestamp
-		FROM address_utxos
-		ORDER BY total_quantity DESC
+			encode(ma.policy, 'hex') || encode(ma.name, 'hex') as asset_id,
+			encode(ma.policy, 'hex') as policy_id,
+			encode(ma.name, 'hex') as asset_name,
+			SUM(mto.quantity) as total_quantity,
+			encode(t.hash, 'hex') as latest_tx_hash,
+			extract(epoch from b.time)::bigint as timestamp
+		FROM address a
+		JOIN tx_out txo ON a.id = txo.address_id
+		JOIN ma_tx_out mto ON txo.id = mto.tx_out_id
+		JOIN multi_asset ma ON mto.ident = ma.id
+		JOIN tx t ON txo.tx_id = t.id
+		JOIN block b ON t.block_id = b.id
+		WHERE a.address = $1
+		  AND txo.consumed_by_tx_id IS NULL  -- Only unspent outputs
+		  AND t.valid_contract = true
+		  AND mto.quantity > 0
+		GROUP BY ma.id, ma.policy, ma.name, t.hash, b.time
+		HAVING SUM(mto.quantity) > 0
+		ORDER BY SUM(mto.quantity) DESC
 		LIMIT 1000
 	`
 
@@ -971,14 +982,21 @@ func getAssetHoldingsFromMainDB(address string) ([]map[string]interface{}, error
 	defer rows.Close()
 
 	var holdings []map[string]interface{}
+	assetsSeen := make(map[string]bool) // Deduplicate assets
+	
 	for rows.Next() {
 		var assetID, policyID, assetName, lastTxHash string
 		var quantity, timestamp int64
-		var metadataBytes []byte
 
-		if err := rows.Scan(&assetID, &policyID, &assetName, &quantity, &metadataBytes, &lastTxHash, &timestamp); err != nil {
+		if err := rows.Scan(&assetID, &policyID, &assetName, &quantity, &lastTxHash, &timestamp); err != nil {
 			continue
 		}
+
+		// Skip if we've already processed this asset (due to GROUP BY on tx.hash)
+		if assetsSeen[assetID] {
+			continue
+		}
+		assetsSeen[assetID] = true
 
 		holding := map[string]interface{}{
 			"asset_id":     assetID,
@@ -990,21 +1008,18 @@ func getAssetHoldingsFromMainDB(address string) ([]map[string]interface{}, error
 			"source":       "main_db", // Indicate this came from main DB
 		}
 
-		// Parse and extract NFT metadata/traits
-		if len(metadataBytes) > 0 {
-			var metadata map[string]interface{}
-			if err := json.Unmarshal(metadataBytes, &metadata); err == nil {
-				holding["metadata"] = metadata
-				
-				// Extract traits for Discord role assignment
-				if traits := extractNFTTraits(metadata, policyID, assetName); len(traits) > 0 {
-					holding["traits"] = traits
-				}
-				
-				// Add useful NFT info
-				if nftInfo := extractNFTInfo(metadata, policyID); nftInfo != nil {
-					holding["nft_info"] = nftInfo
-				}
+		// Try to get metadata for this asset (separate query for simplicity)
+		if metadata := getAssetMetadata(assetID, policyID, assetName); metadata != nil {
+			holding["metadata"] = metadata
+			
+			// Extract traits for Discord role assignment
+			if traits := extractNFTTraits(metadata, policyID, assetName); len(traits) > 0 {
+				holding["traits"] = traits
+			}
+			
+			// Add useful NFT info
+			if nftInfo := extractNFTInfo(metadata, policyID); nftInfo != nil {
+				holding["nft_info"] = nftInfo
 			}
 		}
 
@@ -1012,6 +1027,40 @@ func getAssetHoldingsFromMainDB(address string) ([]map[string]interface{}, error
 	}
 
 	return holdings, nil
+}
+
+// Get metadata for a specific asset
+func getAssetMetadata(assetID, policyID, assetName string) map[string]interface{} {
+	// Find the first minting transaction for this asset to get metadata
+	query := `
+		SELECT COALESCE(tm.json, '{}'::jsonb) as metadata
+		FROM multi_asset ma
+		JOIN ma_tx_out mto ON ma.id = mto.ident
+		JOIN tx_out txo ON mto.tx_out_id = txo.id
+		JOIN tx t ON txo.tx_id = t.id
+		LEFT JOIN tx_metadata tm ON t.id = tm.tx_id AND tm.key = 721
+		WHERE encode(ma.policy, 'hex') = $1
+		  AND encode(ma.name, 'hex') = $2
+		  AND mto.quantity > 0
+		  AND t.valid_contract = true
+		ORDER BY t.id ASC
+		LIMIT 1
+	`
+
+	var metadataBytes []byte
+	err := db.QueryRowContext(ctx, query, policyID, assetName).Scan(&metadataBytes)
+	if err != nil {
+		return nil
+	}
+
+	if len(metadataBytes) > 0 {
+		var metadata map[string]interface{}
+		if err := json.Unmarshal(metadataBytes, &metadata); err == nil {
+			return metadata
+		}
+	}
+
+	return nil
 }
 
 // Execute holdings query and parse results
