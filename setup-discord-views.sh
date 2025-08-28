@@ -4,7 +4,15 @@
 # This creates ultra-fast materialized views for Discord role assignment
 
 API_BASE="http://localhost:8080"
-API_KEY="your-api-key-here"
+API_KEY="${API_KEY:-your-api-key-here}"
+
+# Check if API key is set
+if [ "$API_KEY" = "your-api-key-here" ]; then
+    echo "⚠️  Please set your API key:"
+    echo "   export API_KEY=your-actual-api-key"
+    echo "   Then run this script again"
+    exit 1
+fi
 
 echo "🚀 Setting up Discord Bot Real-Time Data System"
 echo "================================================"
@@ -12,11 +20,12 @@ echo "================================================"
 # Step 1: Apply database migrations
 echo ""
 echo "1️⃣  Applying database migrations..."
-echo "Running: psql \$DB_URL -f migrations/migrations.sql"
-if psql $DB_URL -f migrations/migrations.sql > /dev/null 2>&1; then
+echo "Running: psql -h 0.0.0.0 -p 5432 -U postgres -d cexplorer -f migrations/migrations.sql"
+if psql -h 0.0.0.0 -p 5432 -U postgres -d cexplorer -f migrations/migrations.sql > /dev/null 2>&1; then
     echo "✅ Database migrations applied successfully"
 else
     echo "❌ Failed to apply migrations - check database connection"
+    echo "   Make sure PostgreSQL is running and credentials are correct"
     exit 1
 fi
 
@@ -77,8 +86,8 @@ echo "   • Data refreshed every minute (max 1-minute stale)"
 echo "   • Handles 1000+ simultaneous Discord users"
 echo ""
 echo "🔄 To keep data up-to-date, set up a cron job:"
-echo "   # Refresh every minute"
-echo "   * * * * * curl -s -H \"X-API-Key: $API_KEY\" -H \"Content-Type: application/json\" -d '{\"action\": \"holdings\"}' $API_BASE/preebot/refresh-discord-views"
+echo "   # Refresh every minute - add this to your crontab (crontab -e):"
+echo "   * * * * * export API_KEY=$API_KEY && curl -s -H \"X-API-Key: \$API_KEY\" -H \"Content-Type: application/json\" -d '{\"action\": \"holdings\"}' $API_BASE/preebot/refresh-discord-views"
 echo ""
 echo "🎮 Ready for your Discord bot!"
 echo "   Use: GET /preebot/asset-holdings?address=<address>"
