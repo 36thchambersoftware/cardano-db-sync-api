@@ -312,6 +312,67 @@ func main() {
 	http.HandleFunc("/preebot/cache-nft-metadata", authHandler(preebotCacheNFTMetadataHandler)) // Populate NFT metadata cache for Discord
 	http.HandleFunc("/preebot/refresh-discord-views", authHandler(preebotRefreshDiscordViewsHandler)) // Refresh materialized views for real-time Discord data
 	
+	// PREEBOT-SPECIFIC API - Complete replacement for Koios and Blockfrost
+	// Address and Account endpoints
+	http.HandleFunc("/preebot-api/addresses/", authHandler(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if strings.Contains(path, "/transactions") {
+			preebotAddressTransactionsHandler(w, r)
+		} else {
+			preebotAddressInfoHandler(w, r)
+		}
+	}))
+	http.HandleFunc("/preebot-api/accounts/", authHandler(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if strings.Contains(path, "/history") {
+			preebotDelegationHistoryHandler(w, r)
+		} else if strings.Contains(path, "/assets") {
+			preebotAccountAssetsHandler(w, r)
+		} else {
+			preebotAccountInfoHandler(w, r)
+		}
+	}))
+	
+	// Pool endpoints
+	http.HandleFunc("/preebot-api/pools/", authHandler(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if strings.Contains(path, "/blocks") {
+			preebotPoolBlocksHandler(w, r)
+		} else {
+			preebotPoolInfoHandler(w, r)
+		}
+	}))
+	
+	// Asset endpoints
+	http.HandleFunc("/preebot-api/assets/", authHandler(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if strings.Contains(path, "/policy/") && strings.Contains(path, "/mints") {
+			preebotAssetMintsHandler(w, r)
+		} else if strings.Contains(path, "/policy/") {
+			preebotAssetsByPolicyHandler(w, r)
+		} else if strings.Contains(path, "/utxos") {
+			preebotAssetUTXOsHandler(w, r)
+		} else {
+			writeError(w, http.StatusNotFound, "Asset endpoint not found")
+		}
+	}))
+	
+	// Transaction endpoints
+	http.HandleFunc("/preebot-api/txs/", authHandler(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if strings.Contains(path, "/utxos") {
+			preebotTransactionUTXOsHandler(w, r)
+		} else {
+			writeError(w, http.StatusNotFound, "Transaction endpoint not found")
+		}
+	}))
+	
+	// Blockchain info endpoints
+	http.HandleFunc("/preebot-api/tip", authHandler(preebotBlockchainTipHandler))
+	
+	// Handle resolution endpoint
+	http.HandleFunc("/preebot-api/handles/", authHandler(preebotHandleResolutionHandler))
+	
 	// Legacy endpoints (also protected)
 	registerRoute("/nft-owners", "Get address → NFT count for a specific policy ID.", "/nft-owners?policy_id=<your_policy_id>", authHandler(nftOwnersHandler))
 
