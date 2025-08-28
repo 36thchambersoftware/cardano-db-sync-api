@@ -740,5 +740,230 @@ EXCEPTION WHEN OTHERS THEN
 END;
 $$ LANGUAGE plpgsql;
 
+-- ========================================
+-- REAL-TIME MATERIALIZED VIEWS FOR DISCORD BOT
+-- ========================================
+-- Lightning-fast materialized views refreshed every minute for Discord role assignment
+
+-- MATERIALIZED VIEW: Current asset holdings (refreshed every 1 minute)
+CREATE MATERIALIZED VIEW IF NOT EXISTS discord_asset_holdings AS
+SELECT 
+    a.address,
+    encode(ma.policy, 'hex') as policy_id,
+    encode(ma.name, 'hex') as asset_name,
+    encode(ma.policy, 'hex') || encode(ma.name, 'hex') as asset_id,
+    SUM(mto.quantity) as total_quantity,
+    COUNT(*) as utxo_count,
+    MAX(extract(epoch from b.time)::bigint) as last_tx_time,
+    MAX(encode(t.hash, 'hex')) as last_tx_hash
+FROM address a
+JOIN tx_out txo ON a.id = txo.address_id
+JOIN ma_tx_out mto ON txo.id = mto.tx_out_id
+JOIN multi_asset ma ON mto.ident = ma.id
+JOIN tx t ON txo.tx_id = t.id
+JOIN block b ON t.block_id = b.id
+WHERE txo.consumed_by_tx_id IS NULL
+  AND t.valid_contract = true
+  AND mto.quantity > 0
+GROUP BY a.address, ma.policy, ma.name
+HAVING SUM(mto.quantity) > 0;
+
+-- Indexes for lightning-fast Discord queries
+CREATE UNIQUE INDEX IF NOT EXISTS idx_discord_holdings_unique 
+ON discord_asset_holdings (address, asset_id);
+
+CREATE INDEX IF NOT EXISTS idx_discord_holdings_address 
+ON discord_asset_holdings (address);
+
+CREATE INDEX IF NOT EXISTS idx_discord_holdings_policy 
+ON discord_asset_holdings (policy_id);
+
+CREATE INDEX IF NOT EXISTS idx_discord_holdings_quantity 
+ON discord_asset_holdings (total_quantity DESC);
+
+-- MATERIALIZED VIEW: NFT metadata cache (refreshed when needed)
+CREATE MATERIALIZED VIEW IF NOT EXISTS discord_nft_metadata AS
+SELECT DISTINCT ON (ma.id)
+    encode(ma.policy, 'hex') as policy_id,
+    encode(ma.name, 'hex') as asset_name,
+    encode(ma.policy, 'hex') || encode(ma.name, 'hex') as asset_id,
+    tm.json as metadata,
+    -- Extract common traits directly in SQL for speed
+    CASE 
+        WHEN tm.json IS NOT NULL THEN
+            COALESCE(
+                tm.json->encode(ma.policy, 'hex')->encode(ma.name, 'hex')->'attributes',
+                tm.json->encode(ma.policy, 'hex')->encode(ma.name, 'hex')->'traits',
+                tm.json->encode(ma.policy, 'hex')->''->'attributes',
+                '{}'::jsonb
+            )
+        ELSE '{}'::jsonb
+    END as traits,
+    -- Extract name
+    COALESCE(
+        tm.json->encode(ma.policy, 'hex')->encode(ma.name, 'hex')->>'name',
+        tm.json->encode(ma.policy, 'hex')->''->'name'
+    ) as nft_name,
+    -- Extract image
+    COALESCE(
+        tm.json->encode(ma.policy, 'hex')->encode(ma.name, 'hex')->>'image',
+        tm.json->encode(ma.policy, 'hex')->''->'image'
+    ) as image_url,
+    encode(t.hash, 'hex') as mint_tx_hash,
+    extract(epoch from b.time)::bigint as mint_time
+FROM multi_asset ma
+JOIN ma_tx_out mto ON ma.id = mto.ident
+JOIN tx_out txo ON mto.tx_out_id = txo.id
+JOIN tx t ON txo.tx_id = t.id
+JOIN block b ON t.block_id = b.id
+LEFT JOIN tx_metadata tm ON t.id = tm.tx_id AND tm.key = 721
+WHERE mto.quantity > 0
+  AND t.valid_contract = true
+ORDER BY ma.id, t.id ASC; -- First transaction = mint
+
+-- Indexes for NFT metadata lookups
+CREATE UNIQUE INDEX IF NOT EXISTS idx_discord_nft_metadata_asset 
+ON discord_nft_metadata (asset_id);
+
+CREATE INDEX IF NOT EXISTS idx_discord_nft_metadata_policy 
+ON discord_nft_metadata (policy_id);
+
+CREATE INDEX IF NOT EXISTS idx_discord_nft_metadata_traits 
+ON discord_nft_metadata USING gin (traits);
+
+-- MATERIALIZED VIEW: Combined holdings with metadata for Discord (ULTRA FAST)
+CREATE MATERIALIZED VIEW IF NOT EXISTS discord_holdings_with_metadata AS
+SELECT 
+    dah.address,
+    dah.policy_id,
+    dah.asset_name,
+    dah.asset_id,
+    dah.total_quantity,
+    dah.utxo_count,
+    dah.last_tx_time,
+    dah.last_tx_hash,
+    COALESCE(dnm.metadata, '{}'::jsonb) as metadata,
+    COALESCE(dnm.traits, '{}'::jsonb) as traits,
+    dnm.nft_name,
+    dnm.image_url,
+    dnm.mint_tx_hash,
+    -- Classify asset type for Discord role logic
+    CASE 
+        WHEN dah.total_quantity = 1 AND dnm.traits != '{}'::jsonb THEN 'nft'
+        WHEN dah.total_quantity = 1 THEN 'potential_nft'
+        WHEN dah.total_quantity > 1 AND dah.total_quantity <= 10000 THEN 'limited_token'
+        ELSE 'fungible_token'
+    END as asset_type
+FROM discord_asset_holdings dah
+LEFT JOIN discord_nft_metadata dnm ON dah.asset_id = dnm.asset_id;
+
+-- Ultimate index for Discord queries
+CREATE UNIQUE INDEX IF NOT EXISTS idx_discord_combined_unique 
+ON discord_holdings_with_metadata (address, asset_id);
+
+CREATE INDEX IF NOT EXISTS idx_discord_combined_address 
+ON discord_holdings_with_metadata (address);
+
+CREATE INDEX IF NOT EXISTS idx_discord_combined_policy 
+ON discord_holdings_with_metadata (policy_id);
+
+CREATE INDEX IF NOT EXISTS idx_discord_combined_type 
+ON discord_holdings_with_metadata (asset_type);
+
+CREATE INDEX IF NOT EXISTS idx_discord_combined_traits 
+ON discord_holdings_with_metadata USING gin (traits);
+
+-- ========================================
+-- REFRESH FUNCTIONS FOR REAL-TIME UPDATES
+-- ========================================
+
+-- Function to refresh holdings (call every minute)
+CREATE OR REPLACE FUNCTION refresh_discord_holdings()
+RETURNS TEXT AS $$
+DECLARE
+    start_time TIMESTAMP := clock_timestamp();
+    refresh_time TEXT;
+BEGIN
+    -- Refresh asset holdings (fast - usually under 10 seconds)
+    REFRESH MATERIALIZED VIEW CONCURRENTLY discord_asset_holdings;
+    
+    -- Refresh combined view (very fast - just a JOIN)
+    REFRESH MATERIALIZED VIEW discord_holdings_with_metadata;
+    
+    refresh_time := extract(milliseconds from (clock_timestamp() - start_time))::text || 'ms';
+    
+    RETURN 'Discord holdings refreshed in ' || refresh_time;
+    
+EXCEPTION WHEN OTHERS THEN
+    RETURN 'Error refreshing discord holdings: ' || SQLERRM;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to refresh NFT metadata (call when new collections are added)
+CREATE OR REPLACE FUNCTION refresh_discord_nft_metadata()
+RETURNS TEXT AS $$
+DECLARE
+    start_time TIMESTAMP := clock_timestamp();
+    refresh_time TEXT;
+BEGIN
+    -- Refresh NFT metadata (slower - only when needed)
+    REFRESH MATERIALIZED VIEW discord_nft_metadata;
+    
+    -- Refresh combined view
+    REFRESH MATERIALIZED VIEW discord_holdings_with_metadata;
+    
+    refresh_time := extract(milliseconds from (clock_timestamp() - start_time))::text || 'ms';
+    
+    RETURN 'Discord NFT metadata refreshed in ' || refresh_time;
+    
+EXCEPTION WHEN OTHERS THEN
+    RETURN 'Error refreshing NFT metadata: ' || SQLERRM;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function for initial population
+CREATE OR REPLACE FUNCTION initialize_discord_views()
+RETURNS TEXT AS $$
+BEGIN
+    -- Initial population of materialized views
+    REFRESH MATERIALIZED VIEW discord_asset_holdings;
+    REFRESH MATERIALIZED VIEW discord_nft_metadata;
+    REFRESH MATERIALIZED VIEW discord_holdings_with_metadata;
+    
+    RETURN 'Discord materialized views initialized successfully';
+    
+EXCEPTION WHEN OTHERS THEN
+    RETURN 'Error initializing discord views: ' || SQLERRM;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create a table to track refresh times
+CREATE TABLE IF NOT EXISTS discord_refresh_log (
+    id SERIAL PRIMARY KEY,
+    view_name TEXT NOT NULL,
+    refreshed_at TIMESTAMP DEFAULT NOW(),
+    refresh_duration_ms INTEGER,
+    status TEXT DEFAULT 'success',
+    error_message TEXT
+);
+
+-- Function to log refresh operations
+CREATE OR REPLACE FUNCTION log_discord_refresh(view_name TEXT, duration_ms INTEGER, status TEXT DEFAULT 'success', error_msg TEXT DEFAULT NULL)
+RETURNS VOID AS $$
+BEGIN
+    INSERT INTO discord_refresh_log (view_name, refresh_duration_ms, status, error_message)
+    VALUES (view_name, duration_ms, status, error_msg);
+    
+    -- Keep only last 100 entries per view
+    DELETE FROM discord_refresh_log 
+    WHERE id NOT IN (
+        SELECT id FROM discord_refresh_log 
+        WHERE view_name = log_discord_refresh.view_name
+        ORDER BY refreshed_at DESC 
+        LIMIT 100
+    ) AND view_name = log_discord_refresh.view_name;
+END;
+$$ LANGUAGE plpgsql;
+
 -- Update statistics after creating indexes and tables
--- Run: ANALYZE address, tx_out, tx, multi_asset, ma_tx_out, block, tx_metadata, preebot_token_prices, preebot_asset_holdings, preebot_recent_activity, preebot_nft_metadata;
+-- Run: ANALYZE address, tx_out, tx, multi_asset, ma_tx_out, block, tx_metadata, discord_asset_holdings, discord_nft_metadata, discord_holdings_with_metadata;

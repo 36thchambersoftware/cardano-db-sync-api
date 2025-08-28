@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -870,45 +871,93 @@ func preebotAssetHoldingsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Get live asset holdings - LIGHTNING FAST using live tracking table with NFT metadata
+// Get live asset holdings - ULTRA FAST using materialized views (refreshed every minute)
 func getAssetHoldingsLive(address string) ([]map[string]interface{}, error) {
-	// Debug: First check if address exists and has any activity at all
-	var addressExists bool
-	var totalOutputs int64
-	
-	debugQuery := `
+	// ULTRA-FAST: Query the pre-computed materialized view (sub-second response)
+	query := `
 		SELECT 
-			COUNT(*) > 0 as address_exists,
-			COUNT(txo.id) as total_outputs
-		FROM address a
-		LEFT JOIN tx_out txo ON a.id = txo.address_id
-		WHERE a.address = $1
-		GROUP BY a.id
+			address,
+			policy_id,
+			asset_name,
+			asset_id,
+			total_quantity,
+			utxo_count,
+			last_tx_time,
+			last_tx_hash,
+			COALESCE(metadata, '{}'::jsonb) as metadata,
+			COALESCE(traits, '{}'::jsonb) as traits,
+			nft_name,
+			image_url,
+			mint_tx_hash,
+			asset_type
+		FROM discord_holdings_with_metadata
+		WHERE address = $1
+		ORDER BY total_quantity DESC
+		LIMIT 1000
 	`
-	
-	db.QueryRowContext(ctx, debugQuery, address).Scan(&addressExists, &totalOutputs)
-	
-	// First try the optimized live tracking table
-	holdings, err := getAssetHoldingsFromCache(address)
-	if err == nil && len(holdings) > 0 {
-		return holdings, nil
+
+	rows, err := db.QueryContext(ctx, query, address)
+	if err != nil {
+		// Fallback to slower direct query if materialized view doesn't exist yet
+		return getAssetHoldingsFromMainDB(address)
+	}
+	defer rows.Close()
+
+	var holdings []map[string]interface{}
+	for rows.Next() {
+		var address, policyID, assetName, assetID, lastTxHash string
+		var nftName, imageURL, mintTxHash, assetType sql.NullString
+		var totalQuantity, utxoCount, lastTxTime int64
+		var metadataBytes, traitsBytes []byte
+
+		if err := rows.Scan(&address, &policyID, &assetName, &assetID, &totalQuantity, &utxoCount, 
+			&lastTxTime, &lastTxHash, &metadataBytes, &traitsBytes, &nftName, &imageURL, &mintTxHash, &assetType); err != nil {
+			continue
+		}
+
+		holding := map[string]interface{}{
+			"asset_id":     assetID,
+			"policy_id":    policyID,
+			"asset_name":   assetName,
+			"quantity":     strconv.FormatInt(totalQuantity, 10),
+			"utxo_count":   utxoCount,
+			"last_tx_hash": lastTxHash,
+			"last_tx_time": lastTxTime,
+			"asset_type":   assetType.String,
+			"source":       "materialized_view", // Ultra-fast materialized view
+		}
+
+		// Parse metadata if available
+		if len(metadataBytes) > 0 {
+			var metadata map[string]interface{}
+			if err := json.Unmarshal(metadataBytes, &metadata); err == nil {
+				holding["metadata"] = metadata
+			}
+		}
+
+		// Parse traits if available
+		if len(traitsBytes) > 0 {
+			var traits map[string]interface{}
+			if err := json.Unmarshal(traitsBytes, &traits); err == nil && len(traits) > 0 {
+				holding["traits"] = traits
+			}
+		}
+
+		// Add NFT-specific fields
+		if nftName.Valid && nftName.String != "" {
+			holding["nft_name"] = nftName.String
+		}
+		if imageURL.Valid && imageURL.String != "" {
+			holding["image_url"] = imageURL.String
+		}
+		if mintTxHash.Valid && mintTxHash.String != "" {
+			holding["mint_tx_hash"] = mintTxHash.String
+		}
+
+		holdings = append(holdings, holding)
 	}
 
-	// Fallback: Query main database directly (slower but works immediately)
-	mainHoldings, err := getAssetHoldingsFromMainDB(address)
-	if err != nil {
-		// Return debug info if query fails
-		debugHolding := map[string]interface{}{
-			"debug":         true,
-			"address_exists": addressExists,
-			"total_outputs":  totalOutputs,
-			"error":         err.Error(),
-			"source":        "debug",
-		}
-		return []map[string]interface{}{debugHolding}, nil
-	}
-	
-	return mainHoldings, nil
+	return holdings, nil
 }
 
 // Get holdings from live tracking table (fastest)
@@ -948,16 +997,16 @@ func getAssetHoldingsFromCache(address string) ([]map[string]interface{}, error)
 	return executeHoldingsQuery(query, address)
 }
 
-// Get holdings directly from main database (fallback)
+// Get holdings directly from main database (fallback) - ULTRA FAST simplified query
 func getAssetHoldingsFromMainDB(address string) ([]map[string]interface{}, error) {
-	// Simplified direct query to main cardano-db-sync tables
+	// MUCH FASTER: Query unspent UTXOs directly without complex GROUP BY
 	query := `
-		SELECT 
+		SELECT DISTINCT
 			encode(ma.policy, 'hex') || encode(ma.name, 'hex') as asset_id,
 			encode(ma.policy, 'hex') as policy_id,
 			encode(ma.name, 'hex') as asset_name,
-			SUM(mto.quantity) as total_quantity,
-			encode(t.hash, 'hex') as latest_tx_hash,
+			mto.quantity,
+			encode(t.hash, 'hex') as tx_hash,
 			extract(epoch from b.time)::bigint as timestamp
 		FROM address a
 		JOIN tx_out txo ON a.id = txo.address_id
@@ -967,12 +1016,9 @@ func getAssetHoldingsFromMainDB(address string) ([]map[string]interface{}, error
 		JOIN block b ON t.block_id = b.id
 		WHERE a.address = $1
 		  AND txo.consumed_by_tx_id IS NULL  -- Only unspent outputs
-		  AND t.valid_contract = true
 		  AND mto.quantity > 0
-		GROUP BY ma.id, ma.policy, ma.name, t.hash, b.time
-		HAVING SUM(mto.quantity) > 0
-		ORDER BY SUM(mto.quantity) DESC
-		LIMIT 1000
+		ORDER BY mto.quantity DESC
+		LIMIT 500
 	`
 
 	rows, err := db.QueryContext(ctx, query, address)
@@ -982,45 +1028,43 @@ func getAssetHoldingsFromMainDB(address string) ([]map[string]interface{}, error
 	defer rows.Close()
 
 	var holdings []map[string]interface{}
-	assetsSeen := make(map[string]bool) // Deduplicate assets
+	assetTotals := make(map[string]int64) // Sum quantities for same asset
+	assetInfo := make(map[string]map[string]interface{}) // Store asset details
 	
 	for rows.Next() {
-		var assetID, policyID, assetName, lastTxHash string
+		var assetID, policyID, assetName, txHash string
 		var quantity, timestamp int64
 
-		if err := rows.Scan(&assetID, &policyID, &assetName, &quantity, &lastTxHash, &timestamp); err != nil {
+		if err := rows.Scan(&assetID, &policyID, &assetName, &quantity, &txHash, &timestamp); err != nil {
 			continue
 		}
 
-		// Skip if we've already processed this asset (due to GROUP BY on tx.hash)
-		if assetsSeen[assetID] {
-			continue
+		// Sum quantities for the same asset
+		assetTotals[assetID] += quantity
+		
+		// Store asset info (first occurrence)
+		if _, exists := assetInfo[assetID]; !exists {
+			assetInfo[assetID] = map[string]interface{}{
+				"policy_id":    policyID,
+				"asset_name":   assetName,
+				"last_tx_hash": txHash,
+				"timestamp":    timestamp,
+			}
 		}
-		assetsSeen[assetID] = true
+	}
 
+	// Convert to final format
+	for assetID, totalQuantity := range assetTotals {
+		info := assetInfo[assetID]
+		
 		holding := map[string]interface{}{
 			"asset_id":     assetID,
-			"policy_id":    policyID,
-			"asset_name":   assetName,
-			"quantity":     strconv.FormatInt(quantity, 10),
-			"last_tx_hash": lastTxHash,
-			"timestamp":    timestamp,
-			"source":       "main_db", // Indicate this came from main DB
-		}
-
-		// Try to get metadata for this asset (separate query for simplicity)
-		if metadata := getAssetMetadata(assetID, policyID, assetName); metadata != nil {
-			holding["metadata"] = metadata
-			
-			// Extract traits for Discord role assignment
-			if traits := extractNFTTraits(metadata, policyID, assetName); len(traits) > 0 {
-				holding["traits"] = traits
-			}
-			
-			// Add useful NFT info
-			if nftInfo := extractNFTInfo(metadata, policyID); nftInfo != nil {
-				holding["nft_info"] = nftInfo
-			}
+			"policy_id":    info["policy_id"].(string),
+			"asset_name":   info["asset_name"].(string),
+			"quantity":     strconv.FormatInt(totalQuantity, 10),
+			"last_tx_hash": info["last_tx_hash"].(string),
+			"timestamp":    info["timestamp"].(int64),
+			"source":       "main_db_fast", // Indicate this came from fast main DB query
 		}
 
 		holdings = append(holdings, holding)
@@ -1450,6 +1494,55 @@ func preebotCacheNFTMetadataHandler(w http.ResponseWriter, r *http.Request) {
 		"successful":     successCount,
 		"total_cached":   totalCached,
 		"timestamp":      time.Now().Unix(),
+	}
+
+	writeJSON(w, response)
+}
+
+// PREEBOT Refresh Materialized Views - Keep Discord data up-to-date (call every minute)
+// POST /preebot/refresh-discord-views with {"action": "holdings"} or {"action": "metadata"} or {"action": "initialize"}
+func preebotRefreshDiscordViewsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeError(w, http.StatusMethodNotAllowed, "POST method required")
+		return
+	}
+
+	var request struct {
+		Action string `json:"action"` // "holdings", "metadata", or "initialize"
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid JSON body")
+		return
+	}
+
+	var result string
+	var err error
+
+	switch request.Action {
+	case "initialize":
+		// Initial population of all materialized views
+		err = db.QueryRowContext(ctx, "SELECT initialize_discord_views()").Scan(&result)
+	case "holdings":
+		// Refresh just the holdings (call every minute)
+		err = db.QueryRowContext(ctx, "SELECT refresh_discord_holdings()").Scan(&result)
+	case "metadata":
+		// Refresh NFT metadata (call when new collections are added)
+		err = db.QueryRowContext(ctx, "SELECT refresh_discord_nft_metadata()").Scan(&result)
+	default:
+		writeError(w, http.StatusBadRequest, "Action must be 'initialize', 'holdings', or 'metadata'")
+		return
+	}
+
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to refresh views: "+err.Error())
+		return
+	}
+
+	response := map[string]interface{}{
+		"action":    request.Action,
+		"result":    result,
+		"timestamp": time.Now().Unix(),
 	}
 
 	writeJSON(w, response)

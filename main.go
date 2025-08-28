@@ -310,6 +310,7 @@ func main() {
 	http.HandleFunc("/preebot/asset-transfers", authHandler(preebotAssetTransfersHandler)) // 1-minute polling for purchases
 	http.HandleFunc("/preebot/refresh-cache", authHandler(preebotRefreshCacheHandler))   // Cache management for token stats
 	http.HandleFunc("/preebot/cache-nft-metadata", authHandler(preebotCacheNFTMetadataHandler)) // Populate NFT metadata cache for Discord
+	http.HandleFunc("/preebot/refresh-discord-views", authHandler(preebotRefreshDiscordViewsHandler)) // Refresh materialized views for real-time Discord data
 	
 	// Legacy endpoints (also protected)
 	registerRoute("/nft-owners", "Get address → NFT count for a specific policy ID.", "/nft-owners?policy_id=<your_policy_id>", authHandler(nftOwnersHandler))

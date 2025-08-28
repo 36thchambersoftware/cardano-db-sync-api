@@ -1,8 +1,30 @@
-# 🤖 Discord Bot Integration Guide
+# 🤖 Discord Bot Integration Guide - ULTRA-FAST Real-Time System
 
-This API provides lightning-fast endpoints optimized for Discord bot role assignment based on Cardano NFT holdings and traits.
+This API provides **lightning-fast** endpoints optimized for Discord bot role assignment based on Cardano NFT holdings and traits, using **materialized views** that refresh every minute for real-time data with maximum 1-minute staleness.
 
 ## 🚀 Quick Start
+
+### 0. Setup Ultra-Fast System (First Time Only)
+Initialize the materialized views for sub-second Discord queries:
+
+```bash
+# Run the setup script
+./setup-discord-views.sh
+
+# Or manually:
+psql $DB_URL -f migrations/migrations.sql
+curl -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"action": "initialize"}' \
+  http://localhost:8080/preebot/refresh-discord-views
+```
+
+### ⚡ Keep Data Real-Time (Cron Job)
+Set up automatic refresh every minute for real-time Discord data:
+
+```bash
+# Add to crontab (crontab -e)
+* * * * * curl -s -H "X-API-Key: YOUR_API_KEY" -H "Content-Type: application/json" -d '{"action": "holdings"}' http://localhost:8080/preebot/refresh-discord-views
+```
 
 ### 1. Enhanced Asset Holdings
 Get all assets (including NFTs) that an address holds with metadata and traits:
